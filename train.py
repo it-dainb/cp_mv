@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 import wandb
 
-from src.model import CMSegNet, CMSegNetV2
+from src.model import CMSegNet, CMSegNetV2, CMSegNetV2WithAux
 from src.loss import LossV2, LossV1, LossV3
 from dataset import ForgeryDetectionDataset, create_balanced_splits, get_train_transforms, get_val_transforms, extract_instances_from_mask
 from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
@@ -155,8 +155,21 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
         # Mixed precision training
         device_type = 'cuda' if device.type == 'cuda' else 'cpu'
         with autocast(device_type=device_type, enabled=scaler.is_enabled()):
-            outputs = model(images)
-            loss_output = criterion(outputs, masks)
+            # Model version 3 returns dict with 'main', 'boundary', 'offset'
+            model_outputs = model(images)
+            
+            # Extract main output and aux outputs if available
+            if isinstance(model_outputs, dict):
+                outputs = model_outputs['main']
+                aux_outputs = {
+                    'boundary': model_outputs['boundary'],
+                    'offset': model_outputs['offset']
+                }
+            else:
+                outputs = model_outputs
+                aux_outputs = None
+            
+            loss_output = criterion(outputs, masks, aux_outputs=aux_outputs) if aux_outputs else criterion(outputs, masks)
             
             # Handle different loss function outputs
             if loss_version == 1:
@@ -294,8 +307,21 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         
-        outputs = model(images)
-        loss_output = criterion(outputs, masks)
+        # Model version 3 returns dict with 'main', 'boundary', 'offset'
+        model_outputs = model(images)
+        
+        # Extract main output and aux outputs if available
+        if isinstance(model_outputs, dict):
+            outputs = model_outputs['main']
+            aux_outputs = {
+                'boundary': model_outputs['boundary'],
+                'offset': model_outputs['offset']
+            }
+        else:
+            outputs = model_outputs
+            aux_outputs = None
+        
+        loss_output = criterion(outputs, masks, aux_outputs=aux_outputs) if aux_outputs else criterion(outputs, masks)
         
         # Handle different loss function outputs
         if loss_version == 1:
@@ -509,6 +535,11 @@ def main(args):
     elif args.model_version == 2:
         print("Using CMSegNetV2 (dual-stream architecture with high-frequency branch)")
         model = CMSegNetV2()
+    elif args.model_version == 3:
+        print("Using CMSegNetV2WithAux (dual-stream architecture with auxiliary heads)")
+        print(f"  - Auxiliary features from decoder stage {args.aux_decoder_idx}")
+        print(f"  - Boundary detection head + Position offset head")
+        model = CMSegNetV2WithAux(aux_from_decoder_idx=args.aux_decoder_idx)
     else:
         raise ValueError(f"Unknown model version: {args.model_version}")
     
@@ -778,8 +809,10 @@ if __name__ == '__main__':
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
     
     # Model parameters
-    parser.add_argument('--model-version', type=int, default=1, choices=[1, 2],
-                        help='Model version: 1 (CMSegNet) or 2 (CMSegNetV2 - dual-stream architecture)')
+    parser.add_argument('--model-version', type=int, default=1, choices=[1, 2, 3],
+                        help='Model version: 1 (CMSegNet), 2 (CMSegNetV2 - dual-stream), or 3 (CMSegNetV2WithAux - with auxiliary heads)')
+    parser.add_argument('--aux-decoder-idx', type=int, default=1, choices=[0, 1, 2],
+                        help='Decoder stage to extract auxiliary features from (model version 3 only, default: 1 for best balance)')
     
     # Loss function parameters
     parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2, 3],

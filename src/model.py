@@ -192,3 +192,159 @@ class CMSegNetV2(nn.Module):
         x = self.final_conv(x)
         
         return x
+
+
+class CMSegNetV2WithAux(CMSegNetV2):
+    """
+    Enhanced CMSegNetV2 with auxiliary task heads for multi-task learning.
+    
+    Adds:
+    - Boundary detection head: Predicts manipulation boundaries
+    - Position offset head: Predicts offset vectors to region centers
+    
+    Compatible with LossV3 full multi-task mode.
+    """
+    def __init__(self, aux_from_decoder_idx=1):
+        """
+        Args:
+            aux_from_decoder_idx: Which decoder stage to extract features from for aux heads
+                                  (0=deepest/smallest, 3=shallowest/largest)
+                                  Default: 1 (good balance between semantics and resolution)
+        """
+        super().__init__()
+        
+        # Determine feature channels based on decoder index
+        # Decoder channels (after reversal): [1792->160, 160->64, 64->48, 48->24]
+        # Actual output channels: [160, 64, 48, 24]
+        decoder_out_channels = [160, 64, 48, 24]
+        aux_channels = decoder_out_channels[aux_from_decoder_idx]
+        
+        self.aux_from_decoder_idx = aux_from_decoder_idx
+        
+        # Boundary detection head
+        # Predicts boundary probability map [B, 1, H, W]
+        self.boundary_head = nn.Sequential(
+            nn.Conv2d(aux_channels, aux_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(aux_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(aux_channels // 2, aux_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(aux_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(aux_channels // 4, 1, 1)
+        )
+        
+        # Position offset head
+        # Predicts offset vectors (dy, dx) [B, 2, H, W]
+        self.offset_head = nn.Sequential(
+            nn.Conv2d(aux_channels, aux_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(aux_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(aux_channels // 2, aux_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(aux_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(aux_channels // 4, 2, 1)
+        )
+    
+    def forward(self, x, return_aux=True):
+        """
+        Forward pass with optional auxiliary outputs.
+        
+        Args:
+            x: Input image [B, 3, H, W]
+            return_aux: If True, returns dict with main + auxiliary outputs
+                       If False, returns only main output (same as CMSegNetV2)
+        
+        Returns:
+            If return_aux=True:
+                dict with keys:
+                    'main': [B, 1, H, W] - manipulation mask
+                    'boundary': [B, 1, H, W] - boundary map
+                    'offset': [B, 2, H, W] - position offsets (dy, dx)
+            If return_aux=False:
+                [B, 1, H, W] - manipulation mask only
+        """
+        target_size = x.shape[-2:]  # Original input size
+        
+        # Extract features from cognitive branch (RGB)
+        cognitive_features = self.backbone(x, return_ckpt=True)
+        
+        # Extract features from inspective branch (Noise)
+        inspective_features, support_values = self.inspective_branch(x)
+        
+        # Apply EWTB to cognitive features with inspective support
+        enhanced_cognitive = []
+        for idx, (cog_feat, ewtb, fusion) in enumerate(
+            zip(cognitive_features[:-1], self.ewtb_blocks, self.fusions)
+        ):
+            # Match support value dimensions
+            support_v = support_values[min(idx, len(support_values)-1)]
+            if support_v.shape[-2:] != (1, 1):
+                support_v = F.adaptive_avg_pool2d(support_v, 1)
+            
+            # Expand support_v to match spatial dimensions after DWT
+            B, C, H, W = cog_feat.shape
+            # Broadcast to correct channels and expand spatially
+            if support_v.shape[1] != C:
+                # Use repeat instead of expand for channel dimension
+                repeat_factor = (C + support_v.shape[1] - 1) // support_v.shape[1]  # Ceiling division
+                support_v = support_v.repeat(1, repeat_factor, 1, 1)[:, :C, :, :]
+            support_v = support_v.expand(B, C, H // 2, W // 2)
+            
+            # Apply EWTB with support
+            cog_enhanced = ewtb(cog_feat, support_v)
+            
+            # Bidirectional fusion with inspective features
+            insp_feat = inspective_features[min(idx, len(inspective_features)-1)]
+            cog_enhanced = fusion(cog_enhanced, insp_feat)
+            
+            enhanced_cognitive.append(cog_enhanced)
+        
+        # Add the last feature without EWTB
+        enhanced_cognitive.append(cognitive_features[-1])
+        
+        # Decoder with dual-stream fusion (capture intermediate features for aux heads)
+        decoder_features = []
+        x_dec = self.decoders[0](enhanced_cognitive[-2], enhanced_cognitive[-1])
+        decoder_features.append(x_dec)
+        
+        for idx in range(1, min(len(self.decoders), len(enhanced_cognitive) - 1)):
+            feat_idx = -3 - (idx - 1)
+            # Map inspective features: decoder[1]->insp[-1], decoder[2]->insp[-2], decoder[3]->insp[-3]
+            insp_idx = -idx
+            insp_feat = inspective_features[insp_idx] if abs(insp_idx) <= len(inspective_features) else None
+            x_dec = self.decoders[idx](enhanced_cognitive[feat_idx], x_dec, insp_feat)
+            decoder_features.append(x_dec)
+        
+        # Final prediction
+        main_output = self.final_conv(x_dec)
+        
+        # Return early if auxiliary outputs not needed
+        if not return_aux:
+            return main_output
+        
+        # Generate auxiliary predictions from selected decoder stage
+        aux_features = decoder_features[self.aux_from_decoder_idx]
+        
+        # Boundary prediction
+        boundary_output = self.boundary_head(aux_features)
+        boundary_output = F.interpolate(
+            boundary_output, 
+            size=target_size, 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        # Position offset prediction
+        offset_output = self.offset_head(aux_features)
+        offset_output = F.interpolate(
+            offset_output, 
+            size=target_size, 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        return {
+            'main': main_output,
+            'boundary': boundary_output,
+            'offset': offset_output
+        }
