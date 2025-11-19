@@ -11,7 +11,7 @@ from pathlib import Path
 import wandb
 
 from src.model import CMSegNet
-from src.loss import MixedLoss
+from src.loss import CopyMoveForgeryLoss, MixedLoss
 from dataset import ForgeryDetectionDataset, create_balanced_splits, get_train_transforms, get_val_transforms, extract_instances_from_mask
 from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
 
@@ -127,13 +127,14 @@ def calculate_metrics(pred, target, threshold=0.5):
     }
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, device, epoch, log_wandb=True):
+def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, device, epoch, log_wandb=True, use_legacy_loss=False):
     """Train for one epoch"""
     model.train()
     
     running_loss = 0.0
-    running_dice_loss = 0.0
-    running_bce_loss = 0.0
+    running_loss_component1 = 0.0  # dice_loss or focal_loss
+    running_loss_component2 = 0.0  # bce_loss or dice_loss
+    running_loss_component3 = 0.0  # None or boundary_loss
     running_metrics = {
         'iou': 0.0,
         'f1': 0.0,
@@ -154,7 +155,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
         device_type = 'cuda' if device.type == 'cuda' else 'cpu'
         with autocast(device_type=device_type, enabled=scaler.is_enabled()):
             outputs = model(images)
-            total_loss, dice_loss, bce_loss = criterion(outputs, masks)
+            loss_output = criterion(outputs, masks)
+            
+            # Handle different loss function outputs
+            if use_legacy_loss:
+                total_loss, loss_comp1, loss_comp2 = loss_output
+                loss_comp3 = torch.tensor(0.0).to(device)
+            else:
+                total_loss, loss_comp1, loss_comp2, loss_comp3 = loss_output
         
         # Backward pass with gradient scaling
         scaler.scale(total_loss).backward()
@@ -172,8 +180,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
         
         # Update running metrics
         running_loss += total_loss.item()
-        running_dice_loss += dice_loss.item()
-        running_bce_loss += bce_loss.item()
+        running_loss_component1 += loss_comp1.item()
+        running_loss_component2 += loss_comp2.item()
+        running_loss_component3 += loss_comp3.item()
         for key in running_metrics:
             running_metrics[key] += batch_metrics[key]
         
@@ -189,31 +198,41 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
     num_batches = len(dataloader)
     result = {
         'loss': running_loss / num_batches,
-        'dice_loss': running_dice_loss / num_batches,
-        'bce_loss': running_bce_loss / num_batches,
+        'loss_component1': running_loss_component1 / num_batches,
+        'loss_component2': running_loss_component2 / num_batches,
+        'loss_component3': running_loss_component3 / num_batches,
     }
     for key in running_metrics:
         result[key] = running_metrics[key] / num_batches
     
     # Log to wandb
     if log_wandb:
-        wandb.log({
+        log_dict = {
             'train/loss': result['loss'],
-            'train/dice_loss': result['dice_loss'],
-            'train/bce_loss': result['bce_loss'],
             'train/iou': result['iou'],
             'train/f1': result['f1'],
             'train/precision': result['precision'],
             'train/recall': result['recall'],
             'train/specificity': result['specificity'],
             'epoch': epoch
-        })
+        }
+        
+        # Add loss components with appropriate names
+        if use_legacy_loss:
+            log_dict['train/dice_loss'] = result['loss_component1']
+            log_dict['train/bce_loss'] = result['loss_component2']
+        else:
+            log_dict['train/focal_loss'] = result['loss_component1']
+            log_dict['train/dice_loss'] = result['loss_component2']
+            log_dict['train/boundary_loss'] = result['loss_component3']
+        
+        wandb.log(log_dict)
     
     return result
 
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=True, epoch=0):
+def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=True, epoch=0, use_legacy_loss=False):
     """
     Validate the model with both semantic and instance segmentation metrics.
     
@@ -225,12 +244,14 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         compute_of1: Whether to compute competition oF1 score (slower but accurate)
         log_wandb: Whether to log to wandb
         epoch: Current epoch number for logging
+        use_legacy_loss: Whether using legacy MixedLoss or new CopyMoveForgeryLoss
     """
     model.eval()
     
     running_loss = 0.0
-    running_dice_loss = 0.0
-    running_bce_loss = 0.0
+    running_loss_component1 = 0.0  # dice_loss or focal_loss
+    running_loss_component2 = 0.0  # bce_loss or dice_loss
+    running_loss_component3 = 0.0  # None or boundary_loss
     running_metrics = {
         'iou': 0.0,
         'f1': 0.0,
@@ -249,14 +270,22 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         masks = masks.to(device, non_blocking=True)
         
         outputs = model(images)
-        total_loss, dice_loss, bce_loss = criterion(outputs, masks)
+        loss_output = criterion(outputs, masks)
+        
+        # Handle different loss function outputs
+        if use_legacy_loss:
+            total_loss, loss_comp1, loss_comp2 = loss_output
+            loss_comp3 = torch.tensor(0.0).to(device)
+        else:
+            total_loss, loss_comp1, loss_comp2, loss_comp3 = loss_output
         
         pred_probs = torch.sigmoid(outputs)
         batch_metrics = calculate_metrics(pred_probs, masks)
         
         running_loss += total_loss.item()
-        running_dice_loss += dice_loss.item()
-        running_bce_loss += bce_loss.item()
+        running_loss_component1 += loss_comp1.item()
+        running_loss_component2 += loss_comp2.item()
+        running_loss_component3 += loss_comp3.item()
         for key in running_metrics:
             running_metrics[key] += batch_metrics[key]
         
@@ -294,8 +323,9 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
     num_batches = len(dataloader)
     result = {
         'loss': running_loss / num_batches,
-        'dice_loss': running_dice_loss / num_batches,
-        'bce_loss': running_bce_loss / num_batches,
+        'loss_component1': running_loss_component1 / num_batches,
+        'loss_component2': running_loss_component2 / num_batches,
+        'loss_component3': running_loss_component3 / num_batches,
     }
     for key in running_metrics:
         result[key] = running_metrics[key] / num_batches
@@ -308,8 +338,6 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
     if log_wandb:
         log_dict = {
             'val/loss': result['loss'],
-            'val/dice_loss': result['dice_loss'],
-            'val/bce_loss': result['bce_loss'],
             'val/iou': result['iou'],
             'val/f1': result['f1'],
             'val/precision': result['precision'],
@@ -317,6 +345,16 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
             'val/specificity': result['specificity'],
             'epoch': epoch
         }
+        
+        # Add loss components with appropriate names
+        if use_legacy_loss:
+            log_dict['val/dice_loss'] = result['loss_component1']
+            log_dict['val/bce_loss'] = result['loss_component2']
+        else:
+            log_dict['val/focal_loss'] = result['loss_component1']
+            log_dict['val/dice_loss'] = result['loss_component2']
+            log_dict['val/boundary_loss'] = result['loss_component3']
+        
         if 'oF1' in result:
             log_dict['val/oF1'] = result['oF1']
         wandb.log(log_dict)
@@ -357,24 +395,48 @@ def main(args):
     
     # Initialize wandb
     if not args.no_wandb:
+        config_dict = {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'learning_rate': args.lr,
+            'weight_decay': args.weight_decay,
+            'imgsz': args.imgsz,
+            'scheduler': args.scheduler,
+            'min_lr': args.min_lr,
+            'val_split': args.val_split,
+            'seed': args.seed,
+            'amp': args.amp,
+            'compile': args.compile,
+            'use_legacy_loss': args.use_legacy_loss,
+            'dice_weight': args.dice_weight,
+        }
+        
+        # Add scheduler-specific parameters
+        if args.scheduler == 'warmup_cosine':
+            config_dict.update({
+                'warmup_epochs': args.warmup_epochs,
+                'warmup_start_lr': args.warmup_start_lr,
+            })
+        elif args.scheduler == 'cosine_restarts':
+            config_dict.update({
+                't0': args.t0,
+                't_mult': args.t_mult,
+            })
+        
+        # Add CopyMoveForgeryLoss specific parameters
+        if not args.use_legacy_loss:
+            config_dict.update({
+                'focal_weight': args.focal_weight,
+                'boundary_weight': args.boundary_weight,
+                'focal_alpha': args.focal_alpha,
+                'focal_gamma': args.focal_gamma,
+                'boundary_theta': args.boundary_theta,
+            })
+        
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
-            config={
-                'epochs': args.epochs,
-                'batch_size': args.batch_size,
-                'learning_rate': args.lr,
-                'weight_decay': args.weight_decay,
-                'dice_weight': args.dice_weight,
-                'imgsz': args.imgsz,
-                'warmup_epochs': args.warmup_epochs,
-                'warmup_start_lr': args.warmup_start_lr,
-                'min_lr': args.min_lr,
-                'val_split': args.val_split,
-                'seed': args.seed,
-                'amp': args.amp,
-                'compile': args.compile,
-            }
+            config=config_dict
         )
     
     # Initialize model
@@ -392,7 +454,20 @@ def main(args):
         wandb.watch(model, log='all', log_freq=100)
     
     # Initialize loss function
-    criterion = MixedLoss(dice_weight=args.dice_weight, eps=1.0)
+    if args.use_legacy_loss:
+        print("Using legacy MixedLoss (BCE + Dice)")
+        criterion = MixedLoss(dice_weight=args.dice_weight, eps=1.0)
+    else:
+        print("Using CopyMoveForgeryLoss (Focal + Dice + Boundary)")
+        criterion = CopyMoveForgeryLoss(
+            focal_weight=args.focal_weight,
+            dice_weight=args.dice_weight,
+            boundary_weight=args.boundary_weight,
+            focal_alpha=args.focal_alpha,
+            focal_gamma=args.focal_gamma,
+            boundary_theta=args.boundary_theta,
+            dice_eps=1.0
+        )
     
     # Initialize optimizer
     optimizer = optim.AdamW(
@@ -401,14 +476,27 @@ def main(args):
         weight_decay=args.weight_decay
     )
     
-    # Learning rate scheduler with warmup
-    scheduler = WarmupCosineScheduler(
-        optimizer,
-        warmup_epochs=args.warmup_epochs,
-        max_epochs=args.epochs,
-        warmup_start_lr=args.warmup_start_lr,
-        eta_min=args.min_lr
-    )
+    # Learning rate scheduler
+    if args.scheduler == 'warmup_cosine':
+        print(f"Using WarmupCosineScheduler (warmup: {args.warmup_epochs} epochs)")
+        scheduler = WarmupCosineScheduler(
+            optimizer,
+            warmup_epochs=args.warmup_epochs,
+            max_epochs=args.epochs,
+            warmup_start_lr=args.warmup_start_lr,
+            eta_min=args.min_lr
+        )
+    elif args.scheduler == 'cosine_restarts':
+        print(f"Using CosineAnnealingWarmRestarts (T_0: {args.t0}, T_mult: {args.t_mult})")
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=args.t0,
+            T_mult=args.t_mult,
+            eta_min=args.min_lr
+        )
+    else:
+        raise ValueError(f"Unknown scheduler type: {args.scheduler}")
     
     # Initialize gradient scaler for mixed precision
     scaler = GradScaler(enabled=args.amp)
@@ -474,12 +562,20 @@ def main(args):
         # Train
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler, scheduler, device, epoch,
-            log_wandb=(not args.no_wandb)
+            log_wandb=(not args.no_wandb), use_legacy_loss=args.use_legacy_loss
         )
         
-        print(f"Train - Loss: {train_metrics['loss']:.4f}, "
-              f"Dice: {train_metrics['dice_loss']:.4f}, "
-              f"BCE: {train_metrics['bce_loss']:.4f}")
+        # Print loss components
+        if args.use_legacy_loss:
+            print(f"Train - Loss: {train_metrics['loss']:.4f}, "
+                  f"Dice: {train_metrics['loss_component1']:.4f}, "
+                  f"BCE: {train_metrics['loss_component2']:.4f}")
+        else:
+            print(f"Train - Loss: {train_metrics['loss']:.4f}, "
+                  f"Focal: {train_metrics['loss_component1']:.4f}, "
+                  f"Dice: {train_metrics['loss_component2']:.4f}, "
+                  f"Boundary: {train_metrics['loss_component3']:.4f}")
+        
         print(f"        mIoU: {train_metrics['iou']:.4f}, "
               f"mF1: {train_metrics['f1']:.4f}, "
               f"Prec: {train_metrics['precision']:.4f}, "
@@ -489,11 +585,19 @@ def main(args):
         # Validate - compute oF1 every N epochs or on last epoch
         compute_of1 = (epoch % args.of1_freq == 0) or (epoch == args.epochs - 1)
         val_metrics = validate(model, val_loader, criterion, device, compute_of1=compute_of1,
-                              log_wandb=(not args.no_wandb), epoch=epoch)
+                              log_wandb=(not args.no_wandb), epoch=epoch, use_legacy_loss=args.use_legacy_loss)
         
-        print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
-              f"Dice: {val_metrics['dice_loss']:.4f}, "
-              f"BCE: {val_metrics['bce_loss']:.4f}")
+        # Print loss components
+        if args.use_legacy_loss:
+            print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
+                  f"Dice: {val_metrics['loss_component1']:.4f}, "
+                  f"BCE: {val_metrics['loss_component2']:.4f}")
+        else:
+            print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
+                  f"Focal: {val_metrics['loss_component1']:.4f}, "
+                  f"Dice: {val_metrics['loss_component2']:.4f}, "
+                  f"Boundary: {val_metrics['loss_component3']:.4f}")
+        
         print_str = (f"        mIoU: {val_metrics['iou']:.4f}, "
                      f"mF1: {val_metrics['f1']:.4f}, "
                      f"Prec: {val_metrics['precision']:.4f}, "
@@ -504,7 +608,11 @@ def main(args):
         print(print_str)
         
         # Update learning rate
-        scheduler.step()
+        if args.scheduler == 'warmup_cosine':
+            scheduler.step(epoch)
+        elif args.scheduler == 'cosine_restarts':
+            # CosineAnnealingWarmRestarts steps after each epoch
+            scheduler.step()
         
         # Log learning rate to wandb
         if not args.no_wandb:
@@ -560,12 +668,30 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    
+    # Loss function parameters
+    parser.add_argument('--use-legacy-loss', action='store_true', 
+                        help='Use legacy MixedLoss (BCE + Dice) instead of CopyMoveForgeryLoss')
     parser.add_argument('--dice-weight', type=float, default=0.5, help='Dice loss weight')
+    parser.add_argument('--focal-weight', type=float, default=0.5, 
+                        help='Focal loss weight (CopyMoveForgeryLoss only)')
+    parser.add_argument('--boundary-weight', type=float, default=0.3, 
+                        help='Boundary loss weight (CopyMoveForgeryLoss only)')
+    parser.add_argument('--focal-alpha', type=float, default=0.25, 
+                        help='Focal loss alpha parameter (class balance)')
+    parser.add_argument('--focal-gamma', type=float, default=1.0, 
+                        help='Focal loss gamma parameter (focus on hard examples, 1.0 optimal for combined losses)')
+    parser.add_argument('--boundary-theta', type=float, default=5.0, 
+                        help='Boundary loss theta parameter (boundary emphasis strength)')
     
     # Scheduler parameters
-    parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs')
-    parser.add_argument('--warmup-start-lr', type=float, default=1e-6, help='Starting learning rate for warmup')
+    parser.add_argument('--scheduler', type=str, default='warmup_cosine', choices=['warmup_cosine', 'cosine_restarts'],
+                        help='Learning rate scheduler type (warmup_cosine or cosine_restarts)')
+    parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of warmup epochs (warmup_cosine only)')
+    parser.add_argument('--warmup-start-lr', type=float, default=1e-6, help='Starting learning rate for warmup (warmup_cosine only)')
     parser.add_argument('--min-lr', type=float, default=1e-6, help='Minimum learning rate')
+    parser.add_argument('--t0', type=int, default=10, help='Number of epochs for first restart cycle (cosine_restarts only)')
+    parser.add_argument('--t-mult', type=int, default=2, help='Factor to increase cycle length after restart (cosine_restarts only)')
     
     # Optimization parameters
     parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision')
