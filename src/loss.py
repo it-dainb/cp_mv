@@ -41,7 +41,7 @@ class MixedLoss(nn.Module):
         # Compute Dice Loss
         dice_loss = self.dice(y_pred, y_true)
 
-        # Fused weighted sum
-        total_loss = torch.addcmul(bce_loss, self.dice_weight, dice_loss)
+        # Weighted sum of losses
+        total_loss = (1 - self.dice_weight) * bce_loss + self.dice_weight * dice_loss
         
         return total_loss, dice_loss, bce_loss
