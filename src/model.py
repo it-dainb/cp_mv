@@ -69,7 +69,8 @@ class CMSegNet(nn.Module):
         x = self.decoders[0](features_ckpts[-2], features_ckpts[-1])
 
         # Sequential decoder passes - iterate efficiently
-        for idx in range(1, len(self.decoders)):
+        # Only iterate while we have features remaining (features_ckpts length - 2 already used)
+        for idx in range(1, min(len(self.decoders), len(features_ckpts) - 1)):
             feat_idx = -3 - (idx - 1)
             x = self.decoders[idx](features_ckpts[feat_idx], x)
 
