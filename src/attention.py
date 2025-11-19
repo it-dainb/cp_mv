@@ -9,10 +9,7 @@ class ELA(nn.Module):
         self.conv1 = nn.Conv1d(channel, channel, kernel_size=ks, padding=p0, groups=channel, bias=False)
         self.conv2 = nn.Conv1d(channel, channel, kernel_size=ks+2, padding=p1, groups=channel, bias=False)
         
-        # Ensure ng divides channel evenly
-        import math
-        actual_ng = math.gcd(ng, channel)
-        self.gn = nn.GroupNorm(actual_ng, channel)
+        self.gn = nn.GroupNorm(ng, channel)
         self.relu = nn.ReLU()
         self.sig = nn.Sigmoid()
 

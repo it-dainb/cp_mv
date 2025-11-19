@@ -174,8 +174,8 @@ class VRSA(nn.Module):
     def __init__(self, in_channels=16, out_channels=16, atrous_rates=[4, 8, 12, 16]):
         super().__init__()
         self.aspp = ASPP(in_channels, atrous_rates=atrous_rates, out_channels=out_channels)
-        # self.attention = SpatialAttention()
-        self.attention = ELA_Base(out_channels)
+        self.attention = SpatialAttention()
+        # self.attention = ELA_Base(out_channels)
 
     def forward(self, x):
         x = self.aspp(x)
