@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 import numpy as np
 from pathlib import Path
+import wandb
 
 from src.model import CMSegNet
 from src.loss import MixedLoss
@@ -126,7 +127,7 @@ def calculate_metrics(pred, target, threshold=0.5):
     }
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, device, epoch):
+def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, device, epoch, log_wandb=True):
     """Train for one epoch"""
     model.train()
     
@@ -194,11 +195,25 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
     for key in running_metrics:
         result[key] = running_metrics[key] / num_batches
     
+    # Log to wandb
+    if log_wandb:
+        wandb.log({
+            'train/loss': result['loss'],
+            'train/dice_loss': result['dice_loss'],
+            'train/bce_loss': result['bce_loss'],
+            'train/iou': result['iou'],
+            'train/f1': result['f1'],
+            'train/precision': result['precision'],
+            'train/recall': result['recall'],
+            'train/specificity': result['specificity'],
+            'epoch': epoch
+        })
+    
     return result
 
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, compute_of1=True):
+def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=True, epoch=0):
     """
     Validate the model with both semantic and instance segmentation metrics.
     
@@ -208,6 +223,8 @@ def validate(model, dataloader, criterion, device, compute_of1=True):
         criterion: Loss criterion
         device: Device to run on
         compute_of1: Whether to compute competition oF1 score (slower but accurate)
+        log_wandb: Whether to log to wandb
+        epoch: Current epoch number for logging
     """
     model.eval()
     
@@ -287,6 +304,23 @@ def validate(model, dataloader, criterion, device, compute_of1=True):
     if compute_of1 and of1_scores:
         result['oF1'] = np.mean(of1_scores)
     
+    # Log to wandb
+    if log_wandb:
+        log_dict = {
+            'val/loss': result['loss'],
+            'val/dice_loss': result['dice_loss'],
+            'val/bce_loss': result['bce_loss'],
+            'val/iou': result['iou'],
+            'val/f1': result['f1'],
+            'val/precision': result['precision'],
+            'val/recall': result['recall'],
+            'val/specificity': result['specificity'],
+            'epoch': epoch
+        }
+        if 'oF1' in result:
+            log_dict['val/oF1'] = result['oF1']
+        wandb.log(log_dict)
+    
     return result
 
 
@@ -321,6 +355,28 @@ def main(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Initialize wandb
+    if not args.no_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                'epochs': args.epochs,
+                'batch_size': args.batch_size,
+                'learning_rate': args.lr,
+                'weight_decay': args.weight_decay,
+                'dice_weight': args.dice_weight,
+                'imgsz': args.imgsz,
+                'warmup_epochs': args.warmup_epochs,
+                'warmup_start_lr': args.warmup_start_lr,
+                'min_lr': args.min_lr,
+                'val_split': args.val_split,
+                'seed': args.seed,
+                'amp': args.amp,
+                'compile': args.compile,
+            }
+        )
+    
     # Initialize model
     print("Initializing model...")
     model = CMSegNet()
@@ -330,6 +386,10 @@ def main(args):
     if hasattr(torch, 'compile') and args.compile:
         print("Compiling model with torch.compile()...")
         model = torch.compile(model)
+    
+    # Watch model with wandb
+    if not args.no_wandb:
+        wandb.watch(model, log='all', log_freq=100)
     
     # Initialize loss function
     criterion = MixedLoss(dice_weight=args.dice_weight, eps=1.0)
@@ -413,7 +473,8 @@ def main(args):
         
         # Train
         train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, scheduler, device, epoch
+            model, train_loader, criterion, optimizer, scaler, scheduler, device, epoch,
+            log_wandb=(not args.no_wandb)
         )
         
         print(f"Train - Loss: {train_metrics['loss']:.4f}, "
@@ -427,7 +488,8 @@ def main(args):
         
         # Validate - compute oF1 every N epochs or on last epoch
         compute_of1 = (epoch % args.of1_freq == 0) or (epoch == args.epochs - 1)
-        val_metrics = validate(model, val_loader, criterion, device, compute_of1=compute_of1)
+        val_metrics = validate(model, val_loader, criterion, device, compute_of1=compute_of1,
+                              log_wandb=(not args.no_wandb), epoch=epoch)
         
         print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
               f"Dice: {val_metrics['dice_loss']:.4f}, "
@@ -444,6 +506,10 @@ def main(args):
         # Update learning rate
         scheduler.step()
         
+        # Log learning rate to wandb
+        if not args.no_wandb:
+            wandb.log({'learning_rate': optimizer.param_groups[0]['lr'], 'epoch': epoch})
+        
         # Save checkpoint
         if (epoch + 1) % args.save_freq == 0:
             checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch}.pth')
@@ -456,9 +522,22 @@ def main(args):
             best_path = os.path.join(args.output_dir, 'best_model.pth')
             save_checkpoint(model, optimizer, epoch, val_metrics, best_path)
             print(f"New best model saved! {metric_key}: {best_iou:.4f}, IoU: {val_metrics['iou']:.4f}")
+            
+            # Log best model to wandb
+            if not args.no_wandb:
+                wandb.run.summary[f'best_{metric_key}'] = best_iou
+                wandb.run.summary['best_iou'] = val_metrics['iou']
+                # Save model artifact
+                artifact = wandb.Artifact(f'model-{wandb.run.id}', type='model')
+                artifact.add_file(best_path)
+                wandb.log_artifact(artifact)
     
     print("\nTraining completed!")
     print(f"Best validation score: {best_iou:.4f}")
+    
+    # Finish wandb run
+    if not args.no_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':
@@ -498,6 +577,13 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', type=str, default='./checkpoints', help='Output directory')
     parser.add_argument('--save-freq', type=int, default=10, help='Save checkpoint every N epochs')
     parser.add_argument('--of1-freq', type=int, default=5, help='Compute oF1 metric every N epochs (expensive)')
+    
+    # Wandb parameters
+    parser.add_argument('--no-wandb', action='store_true', help='Disable wandb logging')
+    parser.add_argument('--wandb-project', type=str, default='forgery-detection', 
+                        help='Wandb project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None, 
+                        help='Wandb run name (default: auto-generated)')
     
     args = parser.parse_args()
     
