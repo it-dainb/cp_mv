@@ -150,7 +150,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
         optimizer.zero_grad(set_to_none=True)
         
         # Mixed precision training
-        with autocast(enabled=scaler.is_enabled()):
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        with autocast(device_type=device_type, enabled=scaler.is_enabled()):
             outputs = model(images)
             total_loss, dice_loss, bce_loss = criterion(outputs, masks)
         
