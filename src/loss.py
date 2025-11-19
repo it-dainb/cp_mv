@@ -59,8 +59,6 @@ class BoundaryLoss(nn.Module):
         self.theta = theta  # Controls boundary emphasis strength
     
     def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        
         # Compute boundary using morphological gradient approximation
         # Using max pooling and erosion approximation
         kernel_size = 3
@@ -71,8 +69,8 @@ class BoundaryLoss(nn.Module):
         # Weight boundary pixels more heavily
         boundary_weight = 1.0 + self.theta * boundary_mask
         
-        # BCE on boundary-weighted regions
-        bce_loss = F.binary_cross_entropy(probs, targets, reduction='none')
+        # BCE with logits on boundary-weighted regions (safe for autocast)
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         weighted_loss = bce_loss * boundary_weight
         
         return weighted_loss.mean()
