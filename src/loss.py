@@ -300,14 +300,17 @@ class LossV3(nn.Module):
         )
         self.position_loss = PositionLoss()
     
-    def forward(self, outputs, targets, aux_outputs=None):
+    def forward(self, outputs, targets, aux_outputs=None, aux_targets=None):
         """
         Args:
             outputs: [B, 1, H, W] main manipulation prediction (logits)
             targets: [B, 1, H, W] ground truth binary mask
             aux_outputs: dict with optional auxiliary predictions:
                 - 'boundary': [B, 1, H, W] boundary prediction (logits)
-                - 'position': [B, 2, H, W] position offset prediction (dy, dx)
+                - 'offset': [B, 2, H, W] position offset prediction (dy, dx)
+            aux_targets: dict with optional pre-computed auxiliary ground truths:
+                - 'position_offsets': [B, 2, H, W] ground truth offsets (dy, dx)
+                - 'boundary_masks': [B, 1, H, W] ground truth boundary masks
         
         Returns:
             total_loss: weighted combination of all losses
@@ -336,13 +339,27 @@ class LossV3(nn.Module):
         if aux_outputs is not None:
             # Enhanced boundary loss (explicit boundary supervision)
             if 'boundary' in aux_outputs:
-                enhanced_bry = self.enhanced_boundary_loss(aux_outputs['boundary'], targets)
+                # Use pre-computed boundary targets if available
+                if aux_targets and 'boundary_masks' in aux_targets:
+                    gt_boundary = aux_targets['boundary_masks']
+                    enhanced_bry = F.binary_cross_entropy_with_logits(aux_outputs['boundary'], gt_boundary)
+                else:
+                    enhanced_bry = self.enhanced_boundary_loss(aux_outputs['boundary'], targets)
                 total_loss += self.enhanced_boundary_weight * enhanced_bry
                 loss_dict['enhanced_boundary'] = enhanced_bry.item()
             
             # Position offset loss
-            if 'position' in aux_outputs:
-                pos = self.position_loss(aux_outputs['position'], targets)
+            if 'offset' in aux_outputs:
+                # Use pre-computed position offset targets if available
+                if aux_targets and 'position_offsets' in aux_targets:
+                    gt_offsets = aux_targets['position_offsets']
+                    mask_expanded = targets.expand_as(gt_offsets)
+                    # L1 loss on masked regions
+                    pos = F.l1_loss(aux_outputs['offset'] * mask_expanded, gt_offsets * mask_expanded, reduction='sum')
+                    pos = pos / (mask_expanded.sum() + 1e-5)
+                else:
+                    # Fallback to computing offsets from mask (original behavior)
+                    pos = self.position_loss(aux_outputs['offset'], targets)
                 total_loss += self.position_weight * pos
                 loss_dict['position'] = pos.item()
         

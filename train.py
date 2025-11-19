@@ -146,9 +146,25 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
-    for batch_idx, (images, masks, case_ids) in enumerate(pbar):
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+    for batch_idx, batch_data in enumerate(pbar):
+        # Handle both regular and aux target modes
+        if len(batch_data) == 5:
+            # With auxiliary targets: (images, masks, position_offsets, boundary_masks, case_ids)
+            images, masks, position_offsets, boundary_masks, case_ids = batch_data
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            position_offsets = position_offsets.to(device, non_blocking=True)
+            boundary_masks = boundary_masks.to(device, non_blocking=True)
+            aux_targets = {
+                'position_offsets': position_offsets,
+                'boundary_masks': boundary_masks
+            }
+        else:
+            # Regular mode: (images, masks, case_ids)
+            images, masks, case_ids = batch_data
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            aux_targets = None
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -169,7 +185,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
                 outputs = model_outputs
                 aux_outputs = None
             
-            loss_output = criterion(outputs, masks, aux_outputs=aux_outputs) if aux_outputs else criterion(outputs, masks)
+            # Pass aux_outputs and aux_targets only to LossV3 (loss_version == 3)
+            # LossV1 and LossV2 don't support these parameters
+            if loss_version == 3 and aux_outputs and aux_targets:
+                loss_output = criterion(outputs, masks, aux_outputs=aux_outputs, aux_targets=aux_targets)
+            elif loss_version == 3 and aux_outputs:
+                loss_output = criterion(outputs, masks, aux_outputs=aux_outputs)
+            else:
+                loss_output = criterion(outputs, masks)
             
             # Handle different loss function outputs
             if loss_version == 1:
@@ -303,9 +326,25 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
     
     pbar = tqdm(dataloader, desc='Validation')
     
-    for batch_idx, (images, masks, case_ids) in enumerate(pbar):
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+    for batch_idx, batch_data in enumerate(pbar):
+        # Handle both regular and aux target modes
+        if len(batch_data) == 5:
+            # With auxiliary targets: (images, masks, position_offsets, boundary_masks, case_ids)
+            images, masks, position_offsets, boundary_masks, case_ids = batch_data
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            position_offsets = position_offsets.to(device, non_blocking=True)
+            boundary_masks = boundary_masks.to(device, non_blocking=True)
+            aux_targets = {
+                'position_offsets': position_offsets,
+                'boundary_masks': boundary_masks
+            }
+        else:
+            # Regular mode: (images, masks, case_ids)
+            images, masks, case_ids = batch_data
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            aux_targets = None
         
         # Model version 3 returns dict with 'main', 'boundary', 'offset'
         model_outputs = model(images)
@@ -321,7 +360,14 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
             outputs = model_outputs
             aux_outputs = None
         
-        loss_output = criterion(outputs, masks, aux_outputs=aux_outputs) if aux_outputs else criterion(outputs, masks)
+        # Pass aux_outputs and aux_targets only to LossV3 (loss_version == 3)
+        # LossV1 and LossV2 don't support these parameters
+        if loss_version == 3 and aux_outputs and aux_targets:
+            loss_output = criterion(outputs, masks, aux_outputs=aux_outputs, aux_targets=aux_targets)
+        elif loss_version == 3 and aux_outputs:
+            loss_output = criterion(outputs, masks, aux_outputs=aux_outputs)
+        else:
+            loss_output = criterion(outputs, masks)
         
         # Handle different loss function outputs
         if loss_version == 1:
@@ -638,18 +684,23 @@ def main(args):
     )
     
     # Initialize datasets and dataloaders
+    # Enable auxiliary targets for Model V3 + LossV3 (multi-task learning)
+    return_aux_targets = (args.model_version == 3 and args.loss_version == 3)
+    
     train_dataset = ForgeryDetectionDataset(
         samples=train_samples,
         imgsz=args.imgsz,
         split='train',
-        transform=get_train_transforms(args.imgsz)
+        transform=get_train_transforms(args.imgsz),
+        return_aux_targets=return_aux_targets
     )
     
     val_dataset = ForgeryDetectionDataset(
         samples=val_samples,
         imgsz=args.imgsz,
         split='val',
-        transform=get_val_transforms(args.imgsz)
+        transform=get_val_transforms(args.imgsz),
+        return_aux_targets=return_aux_targets
     )
     
     train_loader = DataLoader(

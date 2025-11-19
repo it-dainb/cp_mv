@@ -173,22 +173,26 @@ class ForgeryDetectionDataset(Dataset):
             *.npy - Corresponding masks for supplemental images
     """
     
-    def __init__(self, samples, imgsz=512, split='train', transform=None):
+    def __init__(self, samples, imgsz=512, split='train', transform=None, return_aux_targets=False):
         """
         Args:
             samples: List of sample dictionaries (from create_balanced_splits)
             imgsz: Target image size (height, width)
             split: 'train' or 'val'
             transform: Albumentations transform pipeline
+            return_aux_targets: If True, also return position offsets and boundaries for multi-task learning
         """
         self.samples = samples
         self.imgsz = imgsz if isinstance(imgsz, tuple) else (imgsz, imgsz)
         self.split = split
         self.transform = transform
+        self.return_aux_targets = return_aux_targets
         
         forged_count = sum(1 for s in self.samples if s['is_forged'])
         print(f"Loaded {len(self.samples)} images ({split} set)")
         print(f"  - Forged: {forged_count}, Authentic: {len(self.samples) - forged_count}")
+        if return_aux_targets:
+            print(f"  - Auxiliary targets enabled (position offsets + boundaries)")
     
     def __len__(self):
         return len(self.samples)
@@ -237,7 +241,12 @@ class ForgeryDetectionDataset(Dataset):
             image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
             mask = torch.from_numpy(mask).unsqueeze(0).float()
         
-        return image, mask, sample['case_id']
+        # Generate auxiliary targets if requested
+        if self.return_aux_targets:
+            position_offsets, boundary_mask = generate_position_offset_gt(mask)
+            return image, mask, position_offsets, boundary_mask, sample['case_id']
+        else:
+            return image, mask, sample['case_id']
 
 
 def get_train_transforms(imgsz=512):
@@ -355,3 +364,84 @@ if __name__ == '__main__':
         plt.tight_layout()
         plt.savefig('dataset_visualization.png', dpi=150, bbox_inches='tight')
         print("Visualization saved to dataset_visualization.png")
+
+
+def generate_position_offset_gt(mask):
+    """
+    Generate position offset ground truth for multi-task learning.
+    
+    For each manipulated pixel, computes the offset vector (dy, dx) pointing
+    to the center of the manipulated region. This auxiliary task helps the model
+    learn better feature representations by predicting region centers.
+    
+    Args:
+        mask: torch.Tensor [B, 1, H, W] or [1, H, W] binary mask (0=authentic, 1=forged)
+    
+    Returns:
+        offsets: torch.Tensor [B, 2, H, W] or [2, H, W] position offsets (dy, dx)
+        boundary: torch.Tensor [B, 1, H, W] or [1, H, W] dilated boundary mask
+    
+    Example:
+        >>> mask = torch.randint(0, 2, (2, 1, 256, 256)).float()
+        >>> offsets, boundary = generate_position_offset_gt(mask)
+        >>> print(offsets.shape)  # [2, 2, 256, 256]
+        >>> print(boundary.shape)  # [2, 1, 256, 256]
+    """
+    # Handle both batched and unbatched inputs
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    
+    B, _, H, W = mask.shape
+    device = mask.device
+    dtype = mask.dtype
+    
+    # Create coordinate grids
+    y_coords = torch.arange(H, device=device, dtype=dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+    x_coords = torch.arange(W, device=device, dtype=dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+    
+    # Compute region centers (weighted average by mask)
+    masked_y = y_coords * mask
+    masked_x = x_coords * mask
+    
+    sum_mask = mask.sum(dim=[2, 3], keepdim=True).clamp(min=1e-5)
+    center_y = masked_y.sum(dim=[2, 3], keepdim=True) / sum_mask
+    center_x = masked_x.sum(dim=[2, 3], keepdim=True) / sum_mask
+    
+    # Compute ground truth offsets (center - pixel position)
+    # Note: Offsets point FROM pixel TO center
+    gt_offset_y = center_y - y_coords
+    gt_offset_x = center_x - x_coords
+    offsets = torch.cat([gt_offset_y, gt_offset_x], dim=1)  # [B, 2, H, W]
+    
+    # Generate boundary ground truth (dilated boundaries)
+    # Use morphological gradient: dilation - erosion
+    kernel_size = 3
+    max_pool = torch.nn.functional.max_pool2d(mask, kernel_size, stride=1, padding=kernel_size//2)
+    min_pool = -torch.nn.functional.max_pool2d(-mask, kernel_size, stride=1, padding=kernel_size//2)
+    boundary = max_pool - min_pool
+    
+    # Dilate boundaries for stronger training signal (dilation radius = 4)
+    dilation_kernel = 2 * 4 + 1  # radius 4 -> kernel 9
+    boundary_dilated = torch.nn.functional.max_pool2d(
+        boundary, 
+        dilation_kernel, 
+        stride=1, 
+        padding=dilation_kernel//2
+    )
+    
+    # Ensure output matches input size
+    if boundary_dilated.shape[-2:] != (H, W):
+        boundary_dilated = torch.nn.functional.interpolate(
+            boundary_dilated,
+            size=(H, W),
+            mode='nearest'
+        )
+    
+    if squeeze_output:
+        offsets = offsets.squeeze(0)
+        boundary_dilated = boundary_dilated.squeeze(0)
+    
+    return offsets, boundary_dilated
