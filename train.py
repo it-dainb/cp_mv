@@ -11,7 +11,7 @@ from pathlib import Path
 import wandb
 
 from src.model import CMSegNet
-from src.loss import CopyMoveForgeryLoss, MixedLoss
+from src.loss import LossV2, LossV1
 from dataset import ForgeryDetectionDataset, create_balanced_splits, get_train_transforms, get_val_transforms, extract_instances_from_mask
 from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
 
@@ -127,7 +127,7 @@ def calculate_metrics(pred, target, threshold=0.5):
     }
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, device, epoch, log_wandb=True, use_legacy_loss=False):
+def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, device, epoch, log_wandb=True, loss_version=1):
     """Train for one epoch"""
     model.train()
     
@@ -158,7 +158,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
             loss_output = criterion(outputs, masks)
             
             # Handle different loss function outputs
-            if use_legacy_loss:
+            if loss_version == 1:
                 total_loss, loss_comp1, loss_comp2 = loss_output
                 loss_comp3 = torch.tensor(0.0).to(device)
             else:
@@ -218,7 +218,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
         }
         
         # Add loss components with appropriate names
-        if use_legacy_loss:
+        if loss_version == 1:
             log_dict['train/dice_loss'] = result['loss_component1']
             log_dict['train/bce_loss'] = result['loss_component2']
         else:
@@ -232,7 +232,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
 
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=True, epoch=0, use_legacy_loss=False):
+def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=True, epoch=0, loss_version=1):
     """
     Validate the model with both semantic and instance segmentation metrics.
     
@@ -244,7 +244,7 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         compute_of1: Whether to compute competition oF1 score (slower but accurate)
         log_wandb: Whether to log to wandb
         epoch: Current epoch number for logging
-        use_legacy_loss: Whether using legacy MixedLoss or new CopyMoveForgeryLoss
+        loss_version: Loss function version (1 for LossV1, 2 for LossV2)
     """
     model.eval()
     
@@ -273,7 +273,7 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         loss_output = criterion(outputs, masks)
         
         # Handle different loss function outputs
-        if use_legacy_loss:
+        if loss_version == 1:
             total_loss, loss_comp1, loss_comp2 = loss_output
             loss_comp3 = torch.tensor(0.0).to(device)
         else:
@@ -347,7 +347,7 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         }
         
         # Add loss components with appropriate names
-        if use_legacy_loss:
+        if loss_version == 1:
             log_dict['val/dice_loss'] = result['loss_component1']
             log_dict['val/bce_loss'] = result['loss_component2']
         else:
@@ -407,7 +407,7 @@ def main(args):
             'seed': args.seed,
             'amp': args.amp,
             'compile': args.compile,
-            'use_legacy_loss': args.use_legacy_loss,
+            'loss_version': args.loss_version,
             'dice_weight': args.dice_weight,
         }
         
@@ -423,8 +423,8 @@ def main(args):
                 't_mult': args.t_mult,
             })
         
-        # Add CopyMoveForgeryLoss specific parameters
-        if not args.use_legacy_loss:
+        # Add LossV2 specific parameters
+        if args.loss_version == 2:
             config_dict.update({
                 'focal_weight': args.focal_weight,
                 'boundary_weight': args.boundary_weight,
@@ -454,12 +454,12 @@ def main(args):
         wandb.watch(model, log='all', log_freq=100)
     
     # Initialize loss function
-    if args.use_legacy_loss:
-        print("Using legacy MixedLoss (BCE + Dice)")
-        criterion = MixedLoss(dice_weight=args.dice_weight, eps=1.0)
-    else:
-        print("Using CopyMoveForgeryLoss (Focal + Dice + Boundary)")
-        criterion = CopyMoveForgeryLoss(
+    if args.loss_version == 1:
+        print("Using LossV1 (BCE + Dice)")
+        criterion = LossV1(dice_weight=args.dice_weight, eps=1.0)
+    elif args.loss_version == 2:
+        print("Using LossV2 (Focal + Dice + Boundary)")
+        criterion = LossV2(
             focal_weight=args.focal_weight,
             dice_weight=args.dice_weight,
             boundary_weight=args.boundary_weight,
@@ -468,6 +468,8 @@ def main(args):
             boundary_theta=args.boundary_theta,
             dice_eps=1.0
         )
+    else:
+        raise ValueError(f"Unknown loss version: {args.loss_version}")
     
     # Initialize optimizer
     optimizer = optim.AdamW(
@@ -562,11 +564,11 @@ def main(args):
         # Train
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler, scheduler, device, epoch,
-            log_wandb=(not args.no_wandb), use_legacy_loss=args.use_legacy_loss
+            log_wandb=(not args.no_wandb), loss_version=args.loss_version
         )
         
         # Print loss components
-        if args.use_legacy_loss:
+        if args.loss_version == 1:
             print(f"Train - Loss: {train_metrics['loss']:.4f}, "
                   f"Dice: {train_metrics['loss_component1']:.4f}, "
                   f"BCE: {train_metrics['loss_component2']:.4f}")
@@ -585,10 +587,10 @@ def main(args):
         # Validate - compute oF1 every N epochs or on last epoch
         compute_of1 = (epoch % args.of1_freq == 0) or (epoch == args.epochs - 1)
         val_metrics = validate(model, val_loader, criterion, device, compute_of1=compute_of1,
-                              log_wandb=(not args.no_wandb), epoch=epoch, use_legacy_loss=args.use_legacy_loss)
+                              log_wandb=(not args.no_wandb), epoch=epoch, loss_version=args.loss_version)
         
         # Print loss components
-        if args.use_legacy_loss:
+        if args.loss_version == 1:
             print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
                   f"Dice: {val_metrics['loss_component1']:.4f}, "
                   f"BCE: {val_metrics['loss_component2']:.4f}")
@@ -670,19 +672,19 @@ if __name__ == '__main__':
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
     
     # Loss function parameters
-    parser.add_argument('--use-legacy-loss', action='store_true', 
-                        help='Use legacy MixedLoss (BCE + Dice) instead of CopyMoveForgeryLoss')
+    parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2],
+                        help='Loss function version: 1 (LossV1: BCE + Dice) or 2 (LossV2: Focal + Dice + Boundary)')
     parser.add_argument('--dice-weight', type=float, default=0.5, help='Dice loss weight')
     parser.add_argument('--focal-weight', type=float, default=0.5, 
-                        help='Focal loss weight (CopyMoveForgeryLoss only)')
+                        help='Focal loss weight (LossV2 only)')
     parser.add_argument('--boundary-weight', type=float, default=0.3, 
-                        help='Boundary loss weight (CopyMoveForgeryLoss only)')
+                        help='Boundary loss weight (LossV2 only)')
     parser.add_argument('--focal-alpha', type=float, default=0.25, 
-                        help='Focal loss alpha parameter (class balance)')
+                        help='Focal loss alpha parameter (class balance, LossV2 only)')
     parser.add_argument('--focal-gamma', type=float, default=1.0, 
-                        help='Focal loss gamma parameter (focus on hard examples, 1.0 optimal for combined losses)')
+                        help='Focal loss gamma parameter (focus on hard examples, 1.0 optimal for combined losses, LossV2 only)')
     parser.add_argument('--boundary-theta', type=float, default=5.0, 
-                        help='Boundary loss theta parameter (boundary emphasis strength)')
+                        help='Boundary loss theta parameter (boundary emphasis strength, LossV2 only)')
     
     # Scheduler parameters
     parser.add_argument('--scheduler', type=str, default='warmup_cosine', choices=['warmup_cosine', 'cosine_restarts'],

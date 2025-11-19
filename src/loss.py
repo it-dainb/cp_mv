@@ -77,7 +77,7 @@ class BoundaryLoss(nn.Module):
         
         return weighted_loss.mean()
 
-class CopyMoveForgeryLoss(nn.Module):
+class LossV2(nn.Module):
     """
     Final combined loss for copy-move forgery detection
     
@@ -94,7 +94,7 @@ class CopyMoveForgeryLoss(nn.Module):
                  focal_gamma=1.0,
                  boundary_theta=5.0,
                  dice_eps=1.0):
-        super(CopyMoveForgeryLoss, self).__init__()
+        super(LossV2, self).__init__()
         
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
@@ -118,9 +118,9 @@ class CopyMoveForgeryLoss(nn.Module):
         return total_loss, focal, dice, boundary
 
 
-class MixedLoss(nn.Module):
+class LossV1(nn.Module):
     def __init__(self, dice_weight=0.5, eps=1.0):
-        super(MixedLoss, self).__init__()
+        super(LossV1, self).__init__()
         self.dice_weight = dice_weight
         self.eps = eps
         # BCEWithLogitsLoss already uses fused sigmoid + BCE
@@ -138,3 +138,8 @@ class MixedLoss(nn.Module):
         total_loss = (1 - self.dice_weight) * bce_loss + self.dice_weight * dice_loss
         
         return total_loss, dice_loss, bce_loss
+
+
+# Backward compatibility aliases
+MixedLoss = LossV1
+CopyMoveForgeryLoss = LossV2
