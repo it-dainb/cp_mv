@@ -227,6 +227,9 @@ class ForgeryDetectionDataset(Dataset):
             transformed = self.transform(image=image, mask=mask)
             image = transformed['image']
             mask = transformed['mask']
+            # Add channel dimension if not present (Albumentations returns [H, W])
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
         else:
             # Default: normalize and convert to tensor
             image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
