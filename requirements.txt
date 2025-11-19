@@ -1,0 +1,21 @@
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer Vision
+albumentationsx>=1.3.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Metrics and Optimization
+numba>=0.58.0
+scipy>=1.11.0
+
+# Progress bars
+tqdm>=4.66.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
