@@ -2,6 +2,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .attention import ELA_Base
 
 class ZeroWindow:
     def __init__(self):
@@ -173,11 +174,12 @@ class VRSA(nn.Module):
     def __init__(self, in_channels=16, out_channels=16, atrous_rates=[4, 8, 12, 16]):
         super().__init__()
         self.aspp = ASPP(in_channels, atrous_rates=atrous_rates, out_channels=out_channels)
-        self.sam = SpatialAttention()
+        # self.attention = SpatialAttention()
+        self.attention = ELA_Base(out_channels)
 
     def forward(self, x):
         x = self.aspp(x)
-        x = self.sam(x)
+        x = self.attention(x)
         return x
 
 class CoSA(nn.Module):
