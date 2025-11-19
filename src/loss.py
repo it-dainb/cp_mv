@@ -204,6 +204,8 @@ class EnhancedBoundaryLoss(nn.Module):
         Returns:
             boundary_mask: [B, 1, H, W] dilated boundary mask
         """
+        B, C, H, W = mask.shape
+        
         # Compute morphological gradient (dilation - erosion)
         kernel_size = 3
         max_pool = F.max_pool2d(mask, kernel_size, stride=1, padding=kernel_size//2)
@@ -217,6 +219,14 @@ class EnhancedBoundaryLoss(nn.Module):
             stride=1, 
             padding=self.dilation_kernel//2
         )
+        
+        # Ensure output matches input size (crop if needed due to even kernel size)
+        if boundary_dilated.shape[-2:] != (H, W):
+            boundary_dilated = F.interpolate(
+                boundary_dilated,
+                size=(H, W),
+                mode='nearest'
+            )
         
         return boundary_dilated.detach()
     
