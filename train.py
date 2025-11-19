@@ -10,8 +10,8 @@ import numpy as np
 from pathlib import Path
 import wandb
 
-from src.model import CMSegNet
-from src.loss import LossV2, LossV1
+from src.model import CMSegNet, CMSegNetV2
+from src.loss import LossV2, LossV1, LossV3
 from dataset import ForgeryDetectionDataset, create_balanced_splits, get_train_transforms, get_val_transforms, extract_instances_from_mask
 from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
 
@@ -135,6 +135,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
     running_loss_component1 = 0.0  # dice_loss or focal_loss
     running_loss_component2 = 0.0  # bce_loss or dice_loss
     running_loss_component3 = 0.0  # None or boundary_loss
+    running_loss_dict = {}  # For LossV3 detailed components
     running_metrics = {
         'iou': 0.0,
         'f1': 0.0,
@@ -161,6 +162,17 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
             if loss_version == 1:
                 total_loss, loss_comp1, loss_comp2 = loss_output
                 loss_comp3 = torch.tensor(0.0).to(device)
+            elif loss_version == 3:
+                # LossV3 returns (total_loss, loss_dict)
+                total_loss, loss_dict = loss_output
+                loss_comp1 = torch.tensor(loss_dict.get('focal', 0.0)).to(device)
+                loss_comp2 = torch.tensor(loss_dict.get('dice', 0.0)).to(device)
+                loss_comp3 = torch.tensor(loss_dict.get('boundary', 0.0)).to(device)
+                # Track additional LossV3 components
+                for key, value in loss_dict.items():
+                    if key not in running_loss_dict:
+                        running_loss_dict[key] = 0.0
+                    running_loss_dict[key] += value
             else:
                 total_loss, loss_comp1, loss_comp2, loss_comp3 = loss_output
         
@@ -205,6 +217,10 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
     for key in running_metrics:
         result[key] = running_metrics[key] / num_batches
     
+    # Add LossV3 detailed components if available
+    if running_loss_dict:
+        result['loss_dict'] = {key: value / num_batches for key, value in running_loss_dict.items()}
+    
     # Log to wandb
     if log_wandb:
         log_dict = {
@@ -221,6 +237,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, scheduler, 
         if loss_version == 1:
             log_dict['train/dice_loss'] = result['loss_component1']
             log_dict['train/bce_loss'] = result['loss_component2']
+        elif loss_version == 3:
+            log_dict['train/focal_loss'] = result['loss_component1']
+            log_dict['train/dice_loss'] = result['loss_component2']
+            log_dict['train/boundary_loss'] = result['loss_component3']
+            # Add additional LossV3 components if available
+            if 'loss_dict' in result:
+                for key, value in result['loss_dict'].items():
+                    log_dict[f'train/{key}'] = value
         else:
             log_dict['train/focal_loss'] = result['loss_component1']
             log_dict['train/dice_loss'] = result['loss_component2']
@@ -244,7 +268,7 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         compute_of1: Whether to compute competition oF1 score (slower but accurate)
         log_wandb: Whether to log to wandb
         epoch: Current epoch number for logging
-        loss_version: Loss function version (1 for LossV1, 2 for LossV2)
+        loss_version: Loss function version (1 for LossV1, 2 for LossV2, 3 for LossV3)
     """
     model.eval()
     
@@ -252,6 +276,7 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
     running_loss_component1 = 0.0  # dice_loss or focal_loss
     running_loss_component2 = 0.0  # bce_loss or dice_loss
     running_loss_component3 = 0.0  # None or boundary_loss
+    running_loss_dict = {}  # For LossV3 detailed components
     running_metrics = {
         'iou': 0.0,
         'f1': 0.0,
@@ -276,6 +301,17 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         if loss_version == 1:
             total_loss, loss_comp1, loss_comp2 = loss_output
             loss_comp3 = torch.tensor(0.0).to(device)
+        elif loss_version == 3:
+            # LossV3 returns (total_loss, loss_dict)
+            total_loss, loss_dict = loss_output
+            loss_comp1 = torch.tensor(loss_dict.get('focal', 0.0)).to(device)
+            loss_comp2 = torch.tensor(loss_dict.get('dice', 0.0)).to(device)
+            loss_comp3 = torch.tensor(loss_dict.get('boundary', 0.0)).to(device)
+            # Track additional LossV3 components
+            for key, value in loss_dict.items():
+                if key not in running_loss_dict:
+                    running_loss_dict[key] = 0.0
+                running_loss_dict[key] += value
         else:
             total_loss, loss_comp1, loss_comp2, loss_comp3 = loss_output
         
@@ -330,6 +366,10 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
     for key in running_metrics:
         result[key] = running_metrics[key] / num_batches
     
+    # Add LossV3 detailed components if available
+    if running_loss_dict:
+        result['loss_dict'] = {key: value / num_batches for key, value in running_loss_dict.items()}
+    
     # Add oF1 score if computed
     if compute_of1 and of1_scores:
         result['oF1'] = np.mean(of1_scores)
@@ -350,6 +390,14 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
         if loss_version == 1:
             log_dict['val/dice_loss'] = result['loss_component1']
             log_dict['val/bce_loss'] = result['loss_component2']
+        elif loss_version == 3:
+            log_dict['val/focal_loss'] = result['loss_component1']
+            log_dict['val/dice_loss'] = result['loss_component2']
+            log_dict['val/boundary_loss'] = result['loss_component3']
+            # Add additional LossV3 components if available
+            if 'loss_dict' in result:
+                for key, value in result['loss_dict'].items():
+                    log_dict[f'val/{key}'] = value
         else:
             log_dict['val/focal_loss'] = result['loss_component1']
             log_dict['val/dice_loss'] = result['loss_component2']
@@ -407,6 +455,7 @@ def main(args):
             'seed': args.seed,
             'amp': args.amp,
             'compile': args.compile,
+            'model_version': args.model_version,
             'loss_version': args.loss_version,
             'dice_weight': args.dice_weight,
         }
@@ -433,6 +482,19 @@ def main(args):
                 'boundary_theta': args.boundary_theta,
             })
         
+        # Add LossV3 specific parameters
+        if args.loss_version == 3:
+            config_dict.update({
+                'focal_weight': args.focal_weight,
+                'boundary_weight': args.boundary_weight,
+                'focal_alpha': args.focal_alpha,
+                'focal_gamma': args.focal_gamma,
+                'boundary_theta': args.boundary_theta,
+                'enhanced_boundary_weight': args.enhanced_boundary_weight,
+                'position_weight': args.position_weight,
+                'boundary_dilation': args.boundary_dilation,
+            })
+        
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
@@ -440,8 +502,16 @@ def main(args):
         )
     
     # Initialize model
-    print("Initializing model...")
-    model = CMSegNet()
+    print(f"Initializing model (version {args.model_version})...")
+    if args.model_version == 1:
+        print("Using CMSegNet (single-stream architecture)")
+        model = CMSegNet()
+    elif args.model_version == 2:
+        print("Using CMSegNetV2 (dual-stream architecture with high-frequency branch)")
+        model = CMSegNetV2()
+    else:
+        raise ValueError(f"Unknown model version: {args.model_version}")
+    
     model = model.to(device)
     
     # Optional: Use torch.compile for PyTorch 2.0+ (significant speedup)
@@ -467,6 +537,22 @@ def main(args):
             focal_gamma=args.focal_gamma,
             boundary_theta=args.boundary_theta,
             dice_eps=1.0
+        )
+    elif args.loss_version == 3:
+        print("Using LossV3 (FastForensics multi-task loss)")
+        print(f"  - Main task weights: Focal={args.focal_weight}, Dice={args.dice_weight}, Boundary={args.boundary_weight}")
+        print(f"  - Auxiliary task weights: Enhanced Boundary={args.enhanced_boundary_weight}, Position={args.position_weight}")
+        criterion = LossV3(
+            focal_weight=args.focal_weight,
+            dice_weight=args.dice_weight,
+            boundary_weight=args.boundary_weight,
+            enhanced_boundary_weight=args.enhanced_boundary_weight,
+            position_weight=args.position_weight,
+            focal_alpha=args.focal_alpha,
+            focal_gamma=args.focal_gamma,
+            boundary_theta=args.boundary_theta,
+            dice_eps=1.0,
+            boundary_dilation=args.boundary_dilation
         )
     else:
         raise ValueError(f"Unknown loss version: {args.loss_version}")
@@ -572,6 +658,16 @@ def main(args):
             print(f"Train - Loss: {train_metrics['loss']:.4f}, "
                   f"Dice: {train_metrics['loss_component1']:.4f}, "
                   f"BCE: {train_metrics['loss_component2']:.4f}")
+        elif args.loss_version == 3:
+            print(f"Train - Loss: {train_metrics['loss']:.4f}, "
+                  f"Focal: {train_metrics['loss_component1']:.4f}, "
+                  f"Dice: {train_metrics['loss_component2']:.4f}, "
+                  f"Boundary: {train_metrics['loss_component3']:.4f}")
+            # Print additional LossV3 components if available
+            if 'loss_dict' in train_metrics:
+                loss_dict = train_metrics['loss_dict']
+                print(f"        Enhanced Boundary: {loss_dict.get('enhanced_boundary', 0.0):.4f}, "
+                      f"Position: {loss_dict.get('position', 0.0):.4f}")
         else:
             print(f"Train - Loss: {train_metrics['loss']:.4f}, "
                   f"Focal: {train_metrics['loss_component1']:.4f}, "
@@ -594,6 +690,16 @@ def main(args):
             print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
                   f"Dice: {val_metrics['loss_component1']:.4f}, "
                   f"BCE: {val_metrics['loss_component2']:.4f}")
+        elif args.loss_version == 3:
+            print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
+                  f"Focal: {val_metrics['loss_component1']:.4f}, "
+                  f"Dice: {val_metrics['loss_component2']:.4f}, "
+                  f"Boundary: {val_metrics['loss_component3']:.4f}")
+            # Print additional LossV3 components if available
+            if 'loss_dict' in val_metrics:
+                loss_dict = val_metrics['loss_dict']
+                print(f"        Enhanced Boundary: {loss_dict.get('enhanced_boundary', 0.0):.4f}, "
+                      f"Position: {loss_dict.get('position', 0.0):.4f}")
         else:
             print(f"Val   - Loss: {val_metrics['loss']:.4f}, "
                   f"Focal: {val_metrics['loss_component1']:.4f}, "
@@ -671,20 +777,32 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
     
+    # Model parameters
+    parser.add_argument('--model-version', type=int, default=1, choices=[1, 2],
+                        help='Model version: 1 (CMSegNet) or 2 (CMSegNetV2 - dual-stream architecture)')
+    
     # Loss function parameters
-    parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2],
-                        help='Loss function version: 1 (LossV1: BCE + Dice) or 2 (LossV2: Focal + Dice + Boundary)')
+    parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2, 3],
+                        help='Loss function version: 1 (LossV1: BCE + Dice), 2 (LossV2: Focal + Dice + Boundary), or 3 (LossV3: FastForensics multi-task loss)')
     parser.add_argument('--dice-weight', type=float, default=0.5, help='Dice loss weight')
     parser.add_argument('--focal-weight', type=float, default=0.5, 
-                        help='Focal loss weight (LossV2 only)')
+                        help='Focal loss weight (LossV2/V3)')
     parser.add_argument('--boundary-weight', type=float, default=0.3, 
-                        help='Boundary loss weight (LossV2 only)')
+                        help='Boundary loss weight (LossV2/V3)')
     parser.add_argument('--focal-alpha', type=float, default=0.25, 
-                        help='Focal loss alpha parameter (class balance, LossV2 only)')
+                        help='Focal loss alpha parameter (class balance, LossV2/V3)')
     parser.add_argument('--focal-gamma', type=float, default=1.0, 
-                        help='Focal loss gamma parameter (focus on hard examples, 1.0 optimal for combined losses, LossV2 only)')
+                        help='Focal loss gamma parameter (focus on hard examples, 1.0 optimal for combined losses, LossV2/V3)')
     parser.add_argument('--boundary-theta', type=float, default=5.0, 
-                        help='Boundary loss theta parameter (boundary emphasis strength, LossV2 only)')
+                        help='Boundary loss theta parameter (boundary emphasis strength, LossV2/V3)')
+    
+    # LossV3 specific parameters
+    parser.add_argument('--enhanced-boundary-weight', type=float, default=2.0,
+                        help='Enhanced boundary loss weight (λ_bry from FastForensics, LossV3 only)')
+    parser.add_argument('--position-weight', type=float, default=5.0,
+                        help='Position loss weight (λ_pos from FastForensics, LossV3 only)')
+    parser.add_argument('--boundary-dilation', type=int, default=4,
+                        help='Boundary dilation radius for enhanced boundary loss (LossV3 only)')
     
     # Scheduler parameters
     parser.add_argument('--scheduler', type=str, default='warmup_cosine', choices=['warmup_cosine', 'cosine_restarts'],

@@ -1,8 +1,15 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Tuple
 
 from .effnetv2 import effnetv2_s, MBConv
 from .modules import VRSA, CoSA
+from .frequency import BayarConstrainedConv, DWTDecomposition, IDWTReconstruction
+from .inspective import InspectiveBranch
+from .attention import WaveletGuidedAttention, EfficientWaveletTransformerBlock
+from .fusion import BidirectionalFusion
+from .decoder import DualStreamDecoderBlock
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels_1, in_channels_2, use_cosa=True):
@@ -75,6 +82,113 @@ class CMSegNet(nn.Module):
             x = self.decoders[idx](features_ckpts[feat_idx], x)
 
         # Apply fused final convolutions
+        x = self.final_conv(x)
+        
+        return x
+
+
+# ==================== CMSegNetV2 (Dual-Stream) ====================
+class CMSegNetV2(nn.Module):
+    """Enhanced CMSegNet with FastForensics-inspired dual-stream architecture"""
+    def __init__(self):
+        super().__init__()
+        
+        # Cognitive Branch (RGB stream) - original backbone
+        self.backbone = effnetv2_s()
+        
+        # Inspective Branch (Noise stream)
+        self.inspective_branch = InspectiveBranch(channels=[64, 128, 128])
+        
+        # Wavelet-guided Transformer blocks for cognitive branch
+        # Match actual backbone feature dimensions: [48, 64, 160]
+        self.ewtb_blocks = nn.ModuleList([
+            EfficientWaveletTransformerBlock(dim=48, num_heads=4),
+            EfficientWaveletTransformerBlock(dim=64, num_heads=4),
+            EfficientWaveletTransformerBlock(dim=160, num_heads=4),
+        ])
+        
+        # Bidirectional fusion modules
+        self.fusions = nn.ModuleList([
+            BidirectionalFusion(48, 64),
+            BidirectionalFusion(64, 128),
+            BidirectionalFusion(160, 128),
+        ])
+        
+        # Enhanced decoders with dual-stream fusion
+        decoders = []
+        # Inspective branch outputs: [64, 128, 128] channels (indices 0, 1, 2)
+        # After decoder reversal: decoders[0] gets no insp, decoders[1] gets insp[-1]=128, decoders[2] gets insp[-2]=128, decoders[3] gets insp[-3]=64
+        inspective_channels_forward = [64, 128, 128, 128]  # Channels for each decoder in forward order (before reversal)
+        
+        for idx, (n_layer, (in_c, out_c)) in enumerate(self.backbone.ckpt_layers.items()):
+            insp_c = inspective_channels_forward[min(idx, len(inspective_channels_forward)-1)]
+            decoders.append(
+                DualStreamDecoderBlock(in_c, out_c, insp_c, use_cosa=idx != 0)
+            )
+            
+            if idx == 0:
+                self.dconv = nn.ConvTranspose2d(out_c, in_c, 4, stride=4, padding=0)
+                self.conv_last = nn.Conv2d(in_c, 3, 1)
+        
+        self.decoders = nn.ModuleList(decoders[::-1])
+        self.conv_score = nn.Conv2d(3, 1, 1)
+        
+        # Final convolution sequence
+        self.final_conv = nn.Sequential(
+            self.dconv,
+            self.conv_last,
+            self.conv_score
+        )
+    
+    def forward(self, x):
+        # Extract features from cognitive branch (RGB)
+        cognitive_features = self.backbone(x, return_ckpt=True)
+        
+        # Extract features from inspective branch (Noise)
+        inspective_features, support_values = self.inspective_branch(x)
+        
+        # Apply EWTB to cognitive features with inspective support
+        enhanced_cognitive = []
+        for idx, (cog_feat, ewtb, fusion) in enumerate(
+            zip(cognitive_features[:-1], self.ewtb_blocks, self.fusions)
+        ):
+            # Match support value dimensions
+            support_v = support_values[min(idx, len(support_values)-1)]
+            if support_v.shape[-2:] != (1, 1):
+                support_v = F.adaptive_avg_pool2d(support_v, 1)
+            
+            # Expand support_v to match spatial dimensions after DWT
+            B, C, H, W = cog_feat.shape
+            # Broadcast to correct channels and expand spatially
+            if support_v.shape[1] != C:
+                # Use repeat instead of expand for channel dimension
+                repeat_factor = (C + support_v.shape[1] - 1) // support_v.shape[1]  # Ceiling division
+                support_v = support_v.repeat(1, repeat_factor, 1, 1)[:, :C, :, :]
+            support_v = support_v.expand(B, C, H // 2, W // 2)
+            
+            # Apply EWTB with support
+            cog_enhanced = ewtb(cog_feat, support_v)
+            
+            # Bidirectional fusion with inspective features
+            insp_feat = inspective_features[min(idx, len(inspective_features)-1)]
+            cog_enhanced = fusion(cog_enhanced, insp_feat)
+            
+            enhanced_cognitive.append(cog_enhanced)
+        
+        # Add the last feature without EWTB
+        enhanced_cognitive.append(cognitive_features[-1])
+        
+        # Decoder with dual-stream fusion
+        x = self.decoders[0](enhanced_cognitive[-2], enhanced_cognitive[-1])
+        
+        for idx in range(1, min(len(self.decoders), len(enhanced_cognitive) - 1)):
+            feat_idx = -3 - (idx - 1)
+            # Map inspective features: decoder[1]->insp[-1], decoder[2]->insp[-2], decoder[3]->insp[-3]
+            insp_idx = -idx
+            insp_feat = inspective_features[insp_idx] if abs(insp_idx) <= len(inspective_features) else None
+            x = self.decoders[idx](enhanced_cognitive[feat_idx], x, insp_feat)
+        
+        # Final prediction
         x = self.final_conv(x)
         
         return x
