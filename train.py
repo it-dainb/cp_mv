@@ -13,7 +13,7 @@ import wandb
 from src.model import CMSegNet, CMFreqSegNet
 from src.loss import LossV2, LossV1
 from dataset import ForgeryDetectionDataset, load_samples, get_train_transforms, get_val_transforms, extract_instances_from_mask
-from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
+from competition_metrics import calculate_instance_metrics_from_masks
 
 
 class WarmupCosineScheduler:
@@ -299,18 +299,10 @@ def validate(model, dataloader, criterion, device, compute_of1=True, log_wandb=T
                 pred_instances = extract_instances_from_mask(pred_mask, min_area=50)
                 gt_instances = extract_instances_from_mask(gt_mask, min_area=50)
                 
-                # Calculate oF1
-                if len(gt_instances) == 0:
-                    # Authentic image
-                    score = 1.0 if len(pred_instances) == 0 else 0.0
-                elif len(pred_instances) == 0:
-                    # Missed all instances
-                    score = 0.0
-                else:
-                    metrics = calculate_instance_metrics_from_masks(pred_instances, gt_instances)
-                    score = metrics['oF1']
-                
-                of1_scores.append(score)
+                # Calculate oF1 using the competition metric function
+                # It handles all edge cases (no GT, no pred, etc.)
+                metrics = calculate_instance_metrics_from_masks(pred_instances, gt_instances)
+                of1_scores.append(metrics['oF1'])
         
         pbar.set_postfix({
             'loss': running_loss / (batch_idx + 1),
