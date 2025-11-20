@@ -99,10 +99,14 @@ def copy_samples_to_output(samples, output_dir, split_name):
                 skipped_samples.append((case_id, f"Failed to copy mask: {e}"))
                 continue
         
-        # Create updated sample dict
+        # Create updated sample dict with RELATIVE paths (relative to output_dir)
+        # This allows the dataset to be moved (e.g., from /kaggle/working to /kaggle/input)
+        rel_image_path = dst_image.relative_to(output_dir)
+        rel_mask_path = dst_mask.relative_to(output_dir) if dst_mask is not None else None
+        
         updated_sample = {
-            'image_path': dst_image,
-            'mask_path': dst_mask,
+            'image_path': rel_image_path,
+            'mask_path': rel_mask_path,
             'is_forged': sample['is_forged'],
             'case_id': case_id
         }
@@ -121,25 +125,29 @@ def copy_samples_to_output(samples, output_dir, split_name):
 
 def save_samples(samples, output_path):
     """
-    Save sample list to JSON file.
+    Save sample list to JSON file with relative paths.
+    
+    Paths are stored relative to the dataset root directory, allowing the
+    dataset to be moved (e.g., from /kaggle/working to /kaggle/input).
     
     Args:
-        samples: List of sample dictionaries
+        samples: List of sample dictionaries with relative Path objects
         output_path: Path to save JSON file
     """
-    # Convert Path objects to strings for JSON serialization
+    # Convert Path objects to POSIX-style strings for JSON serialization
+    # Use forward slashes for cross-platform compatibility
     samples_serializable = []
     for sample in samples:
         sample_copy = sample.copy()
-        sample_copy['image_path'] = str(sample_copy['image_path'])
+        sample_copy['image_path'] = sample_copy['image_path'].as_posix()
         if sample_copy['mask_path'] is not None:
-            sample_copy['mask_path'] = str(sample_copy['mask_path'])
+            sample_copy['mask_path'] = sample_copy['mask_path'].as_posix()
         samples_serializable.append(sample_copy)
     
     with open(output_path, 'w') as f:
         json.dump(samples_serializable, f, indent=2)
     
-    print(f"Saved {len(samples)} sample references to {output_path}")
+    print(f"Saved {len(samples)} sample references to {output_path} (relative paths)")
 
 
 def main(args):

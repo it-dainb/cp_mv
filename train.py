@@ -525,8 +525,9 @@ def main(args):
     
     print(f"  Dataset path: {dataset_path}")
     print(f"  Loading: {train_split_path.name}, {val_split_path.name}")
-    train_samples = load_samples(train_split_path)
-    val_samples = load_samples(val_split_path)
+    # Pass dataset_path as base_dir to resolve relative paths
+    train_samples = load_samples(train_split_path, base_dir=dataset_path)
+    val_samples = load_samples(val_split_path, base_dir=dataset_path)
     
     forged_count_train = sum(1 for s in train_samples if s['is_forged'])
     forged_count_val = sum(1 for s in val_samples if s['is_forged'])

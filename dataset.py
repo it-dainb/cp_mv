@@ -15,12 +15,15 @@ import random
 import json
 
 
-def load_samples(input_path):
+def load_samples(input_path, base_dir=None):
     """
     Load sample list from JSON file.
     
     Args:
         input_path: Path to JSON file
+        base_dir: Optional base directory to resolve relative paths.
+                  If provided, relative paths in JSON will be resolved relative to this directory.
+                  If None, paths are used as-is (relative or absolute).
     
     Returns:
         List of sample dictionaries with Path objects
@@ -30,9 +33,18 @@ def load_samples(input_path):
     
     # Convert strings back to Path objects
     for sample in samples:
-        sample['image_path'] = Path(sample['image_path'])
-        if sample['mask_path'] is not None:
-            sample['mask_path'] = Path(sample['mask_path'])
+        image_path = Path(sample['image_path'])
+        mask_path = Path(sample['mask_path']) if sample['mask_path'] is not None else None
+        
+        # If base_dir provided and path is relative, resolve it relative to base_dir
+        if base_dir is not None:
+            if not image_path.is_absolute():
+                image_path = base_dir / image_path
+            if mask_path is not None and not mask_path.is_absolute():
+                mask_path = base_dir / mask_path
+        
+        sample['image_path'] = image_path
+        sample['mask_path'] = mask_path
     
     return samples
 
