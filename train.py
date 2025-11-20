@@ -402,8 +402,7 @@ def main(args):
             'attention_type': args.attention_type,
             'loss_version': args.loss_version,
             'dice_weight': args.dice_weight,
-            'train_split': args.train_split,
-            'val_split': args.val_split,
+            'dataset_path': args.dataset_path,
         }
         
         # Add scheduler-specific parameters
@@ -513,12 +512,21 @@ def main(args):
         start_epoch, _ = load_checkpoint(model, optimizer, args.resume)
         start_epoch += 1
     
-    # Load preprocessed splits from JSON files
-    print("\nLoading preprocessed train/val splits...")
-    print(f"  Train split: {args.train_split}")
-    print(f"  Val split: {args.val_split}")
-    train_samples = load_samples(args.train_split)
-    val_samples = load_samples(args.val_split)
+    # Load preprocessed splits from dataset directory
+    print("\nLoading preprocessed dataset...")
+    dataset_path = Path(args.dataset_path)
+    train_split_path = dataset_path / 'train_samples.json'
+    val_split_path = dataset_path / 'val_samples.json'
+    
+    if not train_split_path.exists():
+        raise FileNotFoundError(f"Train split not found: {train_split_path}")
+    if not val_split_path.exists():
+        raise FileNotFoundError(f"Val split not found: {val_split_path}")
+    
+    print(f"  Dataset path: {dataset_path}")
+    print(f"  Loading: {train_split_path.name}, {val_split_path.name}")
+    train_samples = load_samples(train_split_path)
+    val_samples = load_samples(val_split_path)
     
     forged_count_train = sum(1 for s in train_samples if s['is_forged'])
     forged_count_val = sum(1 for s in val_samples if s['is_forged'])
@@ -664,11 +672,9 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train CMSegNet for segmentation')
     
-    # Data parameters - preprocessed splits only
-    parser.add_argument('--train-split', type=str, required=True,
-                        help='Path to preprocessed train split JSON file (from create_dataset.py)')
-    parser.add_argument('--val-split', type=str, required=True,
-                        help='Path to preprocessed val split JSON file (from create_dataset.py)')
+    # Data parameters - preprocessed dataset directory
+    parser.add_argument('--dataset-path', type=str, required=True,
+                        help='Path to preprocessed dataset directory (from create_dataset.py)')
     
     # Common data parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
@@ -730,10 +736,19 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    # Validate that split files exist
-    if not Path(args.train_split).exists():
-        parser.error(f"Train split file not found: {args.train_split}")
-    if not Path(args.val_split).exists():
-        parser.error(f"Val split file not found: {args.val_split}")
+    # Validate that dataset directory exists
+    dataset_path = Path(args.dataset_path)
+    if not dataset_path.exists():
+        parser.error(f"Dataset directory not found: {args.dataset_path}")
+    if not dataset_path.is_dir():
+        parser.error(f"Dataset path is not a directory: {args.dataset_path}")
+    
+    # Validate that required split files exist
+    train_split_path = dataset_path / 'train_samples.json'
+    val_split_path = dataset_path / 'val_samples.json'
+    if not train_split_path.exists():
+        parser.error(f"Train split file not found: {train_split_path}")
+    if not val_split_path.exists():
+        parser.error(f"Val split file not found: {val_split_path}")
     
     main(args)
