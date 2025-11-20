@@ -167,8 +167,16 @@ class FrequencyConvLayer(nn.Module):
         x_freq = torch.fft.fftshift(x_freq, dim=[-2, -1])
         
         # Apply separate convolutions to real and imaginary components
-        real_out = self.real_conv(x_freq.real)
-        imag_out = self.imag_conv(x_freq.imag)
+        # Extract real and imaginary parts as float32
+        real_part = x_freq.real
+        imag_part = x_freq.imag
+        
+        real_out = self.real_conv(real_part)
+        imag_out = self.imag_conv(imag_part)
+        
+        # Ensure conv outputs are float32 before FFT (AMP may convert them to float16)
+        real_out = real_out.float()
+        imag_out = imag_out.float()
         
         # Combine and transform back to spatial domain
         x_freq_out = torch.complex(real_out, imag_out)
