@@ -49,6 +49,11 @@ class FrequencyFilter(nn.Module):
         """
         assert scale > 2, "Scale must be greater than 2"
         
+        # Save original dtype and convert to float32 for FFT
+        # cuFFT requires float32 for non-power-of-2 dimensions
+        orig_dtype = x.dtype
+        x = x.float()
+        
         # Apply 2D FFT and shift zero frequency to center
         x_freq = torch.fft.fft2(x, norm="ortho")
         x_freq = torch.fft.fftshift(x_freq, dim=[-2, -1])
@@ -64,6 +69,10 @@ class FrequencyFilter(nn.Module):
         x_out = torch.fft.ifft2(x_freq, norm="ortho")
         x_out = torch.real(x_out)
         x_out = F.relu(x_out, inplace=True)
+        
+        # Convert back to original dtype if needed
+        if orig_dtype != torch.float32:
+            x_out = x_out.to(orig_dtype)
         
         return x_out
     
@@ -91,6 +100,10 @@ class FrequencyFilter(nn.Module):
         """
         assert scale > 2, "Scale must be greater than 2"
         
+        # Save original dtype and convert to float32 for FFT
+        orig_dtype = x.dtype
+        x = x.float()
+        
         # Apply 1D FFT along channel dimension and shift
         x_freq = torch.fft.fft(x, dim=1, norm="ortho")
         x_freq = torch.fft.fftshift(x_freq, dim=1)
@@ -105,6 +118,10 @@ class FrequencyFilter(nn.Module):
         x_out = torch.fft.ifft(x_freq, dim=1, norm="ortho")
         x_out = torch.real(x_out)
         x_out = F.relu(x_out, inplace=True)
+        
+        # Convert back to original dtype if needed
+        if orig_dtype != torch.float32:
+            x_out = x_out.to(orig_dtype)
         
         return x_out
 
@@ -141,6 +158,10 @@ class FrequencyConvLayer(nn.Module):
         Returns:
             Output tensor of shape (B, C, H, W) after frequency domain convolution
         """
+        # Save original dtype and convert to float32 for FFT
+        orig_dtype = x.dtype
+        x = x.float()
+        
         # Transform to frequency domain
         x_freq = torch.fft.fft2(x, norm="ortho")
         x_freq = torch.fft.fftshift(x_freq, dim=[-2, -1])
@@ -155,6 +176,10 @@ class FrequencyConvLayer(nn.Module):
         x_out = torch.fft.ifft2(x_freq_out, norm="ortho")
         x_out = torch.real(x_out)
         x_out = F.relu(x_out, inplace=True)
+        
+        # Convert back to original dtype if needed
+        if orig_dtype != torch.float32:
+            x_out = x_out.to(orig_dtype)
         
         return x_out
 
