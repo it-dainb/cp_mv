@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 import wandb
 
-from src.model import CMSegNet
+from src.model import CMSegNet, CMFreqSegNet
 from src.loss import LossV2, LossV1
 from dataset import ForgeryDetectionDataset, load_samples, get_train_transforms, get_val_transforms, extract_instances_from_mask
 from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
@@ -406,6 +406,7 @@ def main(args):
             'seed': args.seed,
             'amp': args.amp,
             'compile': args.compile,
+            'model_mode': args.model_mode,
             'attention_type': args.attention_type,
             'loss_version': args.loss_version,
             'dice_weight': args.dice_weight,
@@ -443,8 +444,16 @@ def main(args):
     
     # Initialize model
     print("Initializing model...")
+    print(f"Using model mode: {args.model_mode}")
     print(f"Using attention type: {args.attention_type}")
-    model = CMSegNet(attention_type=args.attention_type)
+    
+    if args.model_mode == 'img':
+        model = CMSegNet(attention_type=args.attention_type)
+    elif args.model_mode == 'freq':
+        model = CMFreqSegNet(attention_type=args.attention_type)
+    else:
+        raise ValueError(f"Unknown model mode: {args.model_mode}")
+    
     model = model.to(device)
     
     # Optional: Use torch.compile for PyTorch 2.0+ (significant speedup)
@@ -680,6 +689,8 @@ if __name__ == '__main__':
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
     
     # Model parameters
+    parser.add_argument('--model-mode', type=str, default='img', choices=['img', 'freq'],
+                        help='Model mode: img (standard CMSegNet) or freq (frequency-enhanced)')
     parser.add_argument('--attention-type', type=str, default='sa', choices=['sa', 'cara'],
                         help='Attention mechanism type: sa (SpatialAttention) or cara (CARA)')
     
