@@ -59,24 +59,45 @@ def copy_samples_to_output(samples, output_dir, split_name):
     masks_dir.mkdir(parents=True, exist_ok=True)
     
     updated_samples = []
+    skipped_samples = []
     
     print(f"\nCopying {split_name} split files...")
     for sample in tqdm(samples, desc=f"Copying {split_name}"):
         case_id = sample['case_id']
         
-        # Copy image
-        src_image = sample['image_path']
-        # Keep original extension
+        # Convert to Path if it's a string
+        src_image = Path(sample['image_path'])
+        
+        # Check if source image exists
+        if not src_image.exists():
+            skipped_samples.append((case_id, f"Image not found: {src_image}"))
+            continue
+        
+        # Copy image - keep original extension
         image_ext = src_image.suffix
         dst_image = images_dir / f"{case_id}{image_ext}"
-        shutil.copy2(src_image, dst_image)
+        try:
+            shutil.copy2(src_image, dst_image)
+        except Exception as e:
+            skipped_samples.append((case_id, f"Failed to copy image: {e}"))
+            continue
         
         # Copy mask if exists
         dst_mask = None
         if sample['mask_path'] is not None:
-            src_mask = sample['mask_path']
+            src_mask = Path(sample['mask_path'])
+            
+            # Check if source mask exists
+            if not src_mask.exists():
+                skipped_samples.append((case_id, f"Mask not found: {src_mask}"))
+                continue
+            
             dst_mask = masks_dir / f"{case_id}.npy"
-            shutil.copy2(src_mask, dst_mask)
+            try:
+                shutil.copy2(src_mask, dst_mask)
+            except Exception as e:
+                skipped_samples.append((case_id, f"Failed to copy mask: {e}"))
+                continue
         
         # Create updated sample dict
         updated_sample = {
@@ -86,6 +107,14 @@ def copy_samples_to_output(samples, output_dir, split_name):
             'case_id': case_id
         }
         updated_samples.append(updated_sample)
+    
+    # Report any skipped samples
+    if skipped_samples:
+        print(f"\nWarning: Skipped {len(skipped_samples)} samples in {split_name} split:")
+        for case_id, reason in skipped_samples[:10]:  # Show first 10
+            print(f"  - {case_id}: {reason}")
+        if len(skipped_samples) > 10:
+            print(f"  ... and {len(skipped_samples) - 10} more")
     
     return updated_samples
 
@@ -190,8 +219,8 @@ def main(args):
     print(f"    ├── train_samples.json")
     print(f"    ├── val_samples.json")
     print(f"    └── metadata.json")
-    print(f"\nTo use these splits in training, run:")
-    print(f"  python train.py --train-split {train_split_path} --val-split {val_split_path} [other args...]")
+    print(f"\nTo use this dataset in training, run:")
+    print(f"  python train.py --dataset-path {output_dir} [other args...]")
 
 
 if __name__ == '__main__':
