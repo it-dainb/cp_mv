@@ -12,6 +12,29 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import train_test_split
 import random
+import json
+
+
+def load_samples(input_path):
+    """
+    Load sample list from JSON file.
+    
+    Args:
+        input_path: Path to JSON file
+    
+    Returns:
+        List of sample dictionaries with Path objects
+    """
+    with open(input_path, 'r') as f:
+        samples = json.load(f)
+    
+    # Convert strings back to Path objects
+    for sample in samples:
+        sample['image_path'] = Path(sample['image_path'])
+        if sample['mask_path'] is not None:
+            sample['mask_path'] = Path(sample['mask_path'])
+    
+    return samples
 
 
 def create_balanced_splits(image_dir, mask_dir, supplemental_image_dir=None, 

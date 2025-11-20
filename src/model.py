@@ -5,7 +5,11 @@ from .decoder import DecoderBlock
 from.effnetv2 import effnetv2_s
 
 class CMSegNet(nn.Module):
-    def __init__(self):
+    def __init__(self, attention_type='sa'):
+        """
+        Args:
+            attention_type: Type of attention mechanism to use ('sa' for SpatialAttention or 'cara' for CARA)
+        """
         super(CMSegNet, self).__init__()
         
         self.backbone = effnetv2_s()
@@ -16,7 +20,7 @@ class CMSegNet(nn.Module):
 
         decoders = []
         for idx, (n_layer, (in_c, out_c)) in enumerate(self.backbone.ckpt_layers.items()):
-            decoders.append(DecoderBlock(in_c, out_c, use_cosa=idx != 0))
+            decoders.append(DecoderBlock(in_c, out_c, use_cosa=idx != 0, attention_type=attention_type))
 
             if idx == 0:
                 self.dconv = nn.ConvTranspose2d(out_c, in_c, 4, stride=4, padding=0)

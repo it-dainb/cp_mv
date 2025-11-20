@@ -2,7 +2,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .attention import ELA_Base
+from .attention import SpatialAttention, CARA
 
 class ZeroWindow:
     def __init__(self):
@@ -151,31 +151,29 @@ class ASPP(nn.Module):
             outputs.append(conv(x))
         concat = torch.cat(outputs, dim=1)
         return self.project(concat)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv_att = nn.Conv2d(2, 1, 7, padding=3, bias=False)
-
-    def forward(self, x):
-        # Compute mean and max in parallel - more cache efficient
-        avg_map = x.mean(dim=1, keepdim=True)
-        max_map = x.amax(dim=1, keepdim=True)
-
-        # Use torch.cat with out parameter would be ideal but not supported
-        combined = torch.cat([avg_map, max_map], dim=1)
-        att = torch.sigmoid(self.conv_att(combined))
-
-        # Fused multiply-add: x + x * att = x * (1 + att)
-        return x.addcmul(x, att)
-
+    
 class VRSA(nn.Module):
-    def __init__(self, in_channels=16, out_channels=16, atrous_rates=[4, 8, 12, 16]):
+    def __init__(self, in_channels=16, out_channels=16, atrous_rates=[4, 8, 12, 16], attention_type='sa'):
+        """
+        VRSA module with configurable attention mechanism.
+        
+        Args:
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            atrous_rates: Dilation rates for ASPP
+            attention_type: Type of attention ('sa' for SpatialAttention, 'cara' for CARA)
+        """
         super().__init__()
         self.aspp = ASPP(in_channels, atrous_rates=atrous_rates, out_channels=out_channels)
-        self.attention = SpatialAttention()
-        # self.attention = ELA_Base(out_channels)
+        self.attention_type = attention_type
+        
+        # Select attention mechanism based on attention_type
+        if attention_type == 'cara':
+            self.attention = CARA(channels=out_channels, reduction_ratio=8)
+        elif attention_type == 'sa':
+            self.attention = SpatialAttention()
+        else:
+            raise ValueError(f"Unknown attention_type: {attention_type}. Choose 'sa' or 'cara'.")
 
     def forward(self, x):
         x = self.aspp(x)
@@ -183,10 +181,21 @@ class VRSA(nn.Module):
         return x
 
 class CoSA(nn.Module):
-    def __init__(self, topk=16, in_channels=16, out_channels=16, atrous_rates=[4, 8, 12, 16]):
+    def __init__(self, topk=16, in_channels=16, out_channels=16, atrous_rates=[4, 8, 12, 16], attention_type='sa'):
+        """
+        CoSA module combining correlation and VRSA with configurable attention.
+        
+        Args:
+            topk: Number of top-k values to keep in correlation
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+            atrous_rates: Dilation rates for ASPP
+            attention_type: Type of attention ('sa' or 'cara')
+        """
         super().__init__()
         self.corr = Cor(topk=topk)
-        self.vrsa = VRSA(in_channels=in_channels, out_channels=out_channels, atrous_rates=atrous_rates)
+        self.vrsa = VRSA(in_channels=in_channels, out_channels=out_channels, 
+                        atrous_rates=atrous_rates, attention_type=attention_type)
 
     def forward(self, x):
         x = self.corr(x)        

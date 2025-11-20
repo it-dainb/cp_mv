@@ -12,7 +12,7 @@ import wandb
 
 from src.model import CMSegNet
 from src.loss import LossV2, LossV1
-from dataset import ForgeryDetectionDataset, create_balanced_splits, get_train_transforms, get_val_transforms, extract_instances_from_mask
+from dataset import ForgeryDetectionDataset, load_samples, get_train_transforms, get_val_transforms, extract_instances_from_mask
 from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
 
 
@@ -403,12 +403,14 @@ def main(args):
             'imgsz': args.imgsz,
             'scheduler': args.scheduler,
             'min_lr': args.min_lr,
-            'val_split': args.val_split,
             'seed': args.seed,
             'amp': args.amp,
             'compile': args.compile,
+            'attention_type': args.attention_type,
             'loss_version': args.loss_version,
             'dice_weight': args.dice_weight,
+            'train_split': args.train_split,
+            'val_split': args.val_split,
         }
         
         # Add scheduler-specific parameters
@@ -441,7 +443,8 @@ def main(args):
     
     # Initialize model
     print("Initializing model...")
-    model = CMSegNet()
+    print(f"Using attention type: {args.attention_type}")
+    model = CMSegNet(attention_type=args.attention_type)
     model = model.to(device)
     
     # Optional: Use torch.compile for PyTorch 2.0+ (significant speedup)
@@ -509,16 +512,23 @@ def main(args):
         start_epoch, _ = load_checkpoint(model, optimizer, args.resume)
         start_epoch += 1
     
-    # Create balanced train/val splits
-    print("\nCreating balanced train/val splits...")
-    train_samples, val_samples = create_balanced_splits(
-        image_dir=args.train_images,
-        mask_dir=args.train_masks,
-        supplemental_image_dir=args.supplemental_images,
-        supplemental_mask_dir=args.supplemental_masks,
-        val_split=args.val_split,
-        random_seed=args.seed
-    )
+    # Load preprocessed splits from JSON files
+    print("\nLoading preprocessed train/val splits...")
+    print(f"  Train split: {args.train_split}")
+    print(f"  Val split: {args.val_split}")
+    train_samples = load_samples(args.train_split)
+    val_samples = load_samples(args.val_split)
+    
+    forged_count_train = sum(1 for s in train_samples if s['is_forged'])
+    forged_count_val = sum(1 for s in val_samples if s['is_forged'])
+    print(f"\n=== Loaded Split Summary ===")
+    print(f"Train: {len(train_samples)} total")
+    print(f"  - Forged: {forged_count_train}")
+    print(f"  - Authentic: {len(train_samples) - forged_count_train}")
+    print(f"Val: {len(val_samples)} total")
+    print(f"  - Forged: {forged_count_val}")
+    print(f"  - Authentic: {len(val_samples) - forged_count_val}")
+    print("=" * 30)
     
     # Initialize datasets and dataloaders
     train_dataset = ForgeryDetectionDataset(
@@ -653,15 +663,13 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train CMSegNet for segmentation')
     
-    # Data parameters
-    parser.add_argument('--train-images', type=str, required=True, help='Path to training images')
-    parser.add_argument('--train-masks', type=str, required=True, help='Path to training masks')
-    parser.add_argument('--supplemental-images', type=str, default=None, 
-                        help='Path to supplemental images (optional, merged with training data)')
-    parser.add_argument('--supplemental-masks', type=str, default=None,
-                        help='Path to supplemental masks (optional, merged with training data)')
-    parser.add_argument('--val-split', type=float, default=0.2, 
-                        help='Fraction of data to use for validation (default: 0.2)')
+    # Data parameters - preprocessed splits only
+    parser.add_argument('--train-split', type=str, required=True,
+                        help='Path to preprocessed train split JSON file (from create_dataset.py)')
+    parser.add_argument('--val-split', type=str, required=True,
+                        help='Path to preprocessed val split JSON file (from create_dataset.py)')
+    
+    # Common data parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--imgsz', type=int, default=512, help='Input image size (height and width)')
     
@@ -670,6 +678,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    
+    # Model parameters
+    parser.add_argument('--attention-type', type=str, default='sa', choices=['sa', 'cara'],
+                        help='Attention mechanism type: sa (SpatialAttention) or cara (CARA)')
     
     # Loss function parameters
     parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2],
@@ -714,5 +726,11 @@ if __name__ == '__main__':
                         help='Wandb run name (default: auto-generated)')
     
     args = parser.parse_args()
+    
+    # Validate that split files exist
+    if not Path(args.train_split).exists():
+        parser.error(f"Train split file not found: {args.train_split}")
+    if not Path(args.val_split).exists():
+        parser.error(f"Val split file not found: {args.val_split}")
     
     main(args)

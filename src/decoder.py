@@ -11,17 +11,26 @@ import torch.nn as nn
 from .effnetv2 import MBConv
 from .modules import VRSA, CoSA
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels_1, in_channels_2, use_cosa=True):
+    def __init__(self, in_channels_1, in_channels_2, use_cosa=True, attention_type='sa'):
+        """
+        Decoder block with configurable attention mechanism.
+        
+        Args:
+            in_channels_1: Number of channels for encoder feature
+            in_channels_2: Number of channels for decoder feature
+            use_cosa: Whether to use CoSA (True) or VRSA (False)
+            attention_type: Type of attention ('sa' or 'cara')
+        """
         super(DecoderBlock, self).__init__()
 
         self.dconv = nn.ConvTranspose2d(in_channels_2, in_channels_1, 4, padding=1, stride=2)
         self.irb = MBConv(in_channels_1 * 2, in_channels_1, stride=1, expand_ratio=6, use_se=False, use_ela=True)
 
         if use_cosa:
-            self.attention = CoSA(in_channels_1, in_channels_1, in_channels_1)
+            self.attention = CoSA(in_channels_1, in_channels_1, in_channels_1, attention_type=attention_type)
         else:
             self.attention = nn.Sequential(
-                VRSA(in_channels_1, in_channels_1),
+                VRSA(in_channels_1, in_channels_1, attention_type=attention_type),
                 nn.ConvTranspose2d(in_channels_1, in_channels_1, 4, padding=2, stride=1),
             )
 

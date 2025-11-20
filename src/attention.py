@@ -49,3 +49,123 @@ class ELA_Large(ELA):
     def __init__(self, channel, ks=3):
         super(ELA_Large, self).__init__(channel//8, ks=7, ng=16)
 
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv_att = nn.Conv2d(2, 1, 7, padding=3, bias=False)
+
+    def forward(self, x):
+        # Compute mean and max in parallel - more cache efficient
+        avg_map = x.mean(dim=1, keepdim=True)
+        max_map = x.amax(dim=1, keepdim=True)
+
+        # Use torch.cat with out parameter would be ideal but not supported
+        combined = torch.cat([avg_map, max_map], dim=1)
+        att = torch.sigmoid(self.conv_att(combined))
+
+        # Fused multiply-add: x + x * att = x * (1 + att)
+        return x.addcmul(x, att)
+
+
+class CARA(nn.Module):
+    """
+    Coordinate Attention-Resource Allocation (CARA) module.
+    
+    This module refines coarse copy-move areas by weighing the importance of 
+    different positions in the matching map using coordinate attention mechanism.
+    
+    Reference: Hou et al., 2021
+    
+    Args:
+        channels: Number of input channels (C')
+        reduction_ratio: Channel compression factor (r). Default: 8
+    """
+    def __init__(self, channels, reduction_ratio=8):
+        super(CARA, self).__init__()
+        self.channels = channels
+        self.reduction_ratio = reduction_ratio
+        
+        # Transform layer components
+        # Conv2D compresses channels from C' to C'/r
+        self.transform_conv = nn.Conv2d(
+            channels, 
+            channels // reduction_ratio, 
+            kernel_size=1, 
+            bias=False
+        )
+        self.transform_bn = nn.BatchNorm2d(channels // reduction_ratio)
+        self.transform_act = nn.ReLU(inplace=True)
+        
+        # X-direction (height) weight generation
+        self.conv_x = nn.Conv2d(
+            channels // reduction_ratio, 
+            channels, 
+            kernel_size=1, 
+            bias=False
+        )
+        
+        # Y-direction (width) weight generation
+        self.conv_y = nn.Conv2d(
+            channels // reduction_ratio, 
+            channels, 
+            kernel_size=1, 
+            bias=False
+        )
+        
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        """
+        Forward pass of CARA module.
+        
+        Args:
+            x: Input feature map K with shape [B, C', H, W]
+            
+        Returns:
+            Reweighted feature map W with shape [B, C', H, W]
+        """
+        b, c, h, w = x.size()
+        
+        # Step 1: Global Average Pooling along vertical (H) and horizontal (W) axes
+        # XI: GAP along width dimension -> [B, C', H, 1]
+        # Equation (8): XI_c^i = sum(K_c(i, u')) / W
+        XI = torch.mean(x, dim=3, keepdim=True)  # [B, C', H, 1]
+        
+        # YI: GAP along height dimension -> [B, C', 1, W]
+        # Equation (9): YI_c^i' = sum(K_c(i', u)) / H
+        YI = torch.mean(x, dim=2, keepdim=True)  # [B, C', 1, W]
+        
+        # Step 2: Transform layer
+        # Concatenate XI and YI along spatial dimension
+        # Transpose XI from [B, C', H, 1] to [B, C', 1, H]
+        XI_transposed = XI.permute(0, 1, 3, 2)  # [B, C', 1, H]
+        
+        # Concatenate along width dimension: [B, C', 1, H+W]
+        # Equation (10): SI = φ(τ(ω(XI, YI)))
+        concat_features = torch.cat([XI_transposed, YI], dim=3)  # [B, C', 1, H+W]
+        
+        # Apply Conv2D, BN, and activation (compress channels C' -> C'/r)
+        SI = self.transform_conv(concat_features)  # [B, C'/r, 1, H+W]
+        SI = self.transform_bn(SI)
+        SI = self.transform_act(SI)  # [B, C'/r, 1, H+W]
+        
+        # Step 3: Split layer
+        # Split SI into horizontal (H) and vertical (W) components
+        SI_x = SI[:, :, :, :h]  # [B, C'/r, 1, H]
+        SI_y = SI[:, :, :, h:]  # [B, C'/r, 1, W]
+        
+        # Reshape SI_x back to [B, C'/r, H, 1] for height-wise attention
+        SI_x = SI_x.permute(0, 1, 3, 2)  # [B, C'/r, H, 1]
+        
+        # Step 4: Generate X and Y weighted coefficients
+        # Apply Conv2D to increase channels back to C' and sigmoid activation
+        WXI = self.sigmoid(self.conv_x(SI_x))  # [B, C', H, 1]
+        WYI = self.sigmoid(self.conv_y(SI_y))  # [B, C', 1, W]
+        
+        # Step 5: Calculate total weights and reweight feature map
+        # Equation (11): W_c(i,j) = K_c(i,j) × WXI_c(i) × WYI_c(j)
+        # Total weight: [B, C', H, W]
+        output = x * WXI * WYI
+        
+        return output
+
