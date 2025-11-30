@@ -399,7 +399,8 @@ def main(args):
             'amp': args.amp,
             'compile': args.compile,
             'model_mode': args.model_mode,
-            'attention_type': args.attention_type,
+            'encoder_attention_type': args.encoder_attention_type,
+            'decoder_attention_type': args.decoder_attention_type,
             'loss_version': args.loss_version,
             'dice_weight': args.dice_weight,
             'dataset_path': args.dataset_path,
@@ -436,12 +437,13 @@ def main(args):
     # Initialize model
     print("Initializing model...")
     print(f"Using model mode: {args.model_mode}")
-    print(f"Using attention type: {args.attention_type}")
+    print(f"Using encoder attention type: {args.encoder_attention_type}")
+    print(f"Using decoder attention type: {args.decoder_attention_type}")
     
     if args.model_mode == 'img':
-        model = CMSegNet(attention_type=args.attention_type)
+        model = CMSegNet(encoder_attention_type=args.encoder_attention_type, decoder_attention_type=args.decoder_attention_type)
     elif args.model_mode == 'freq':
-        model = CMFreqSegNet(attention_type=args.attention_type)
+        model = CMFreqSegNet(encoder_attention_type=args.encoder_attention_type, decoder_attention_type=args.decoder_attention_type)
     else:
         raise ValueError(f"Unknown model mode: {args.model_mode}")
     
@@ -690,8 +692,10 @@ if __name__ == '__main__':
     # Model parameters
     parser.add_argument('--model-mode', type=str, default='img', choices=['img', 'freq'],
                         help='Model mode: img (standard CMSegNet) or freq (frequency-enhanced)')
-    parser.add_argument('--attention-type', type=str, default='sa', choices=['sa', 'cara', 'ela'],
+    parser.add_argument('--encoder-attention-type', type=str, default='sa', choices=['sa', 'cara', 'ela'],
                         help='Attention mechanism type: sa (SpatialAttention) or cara (CARA) or ela (ELAAttention)')
+    parser.add_argument('--decoder-attention-type', type=str, default='sa', choices=['sa', 'cara'],
+                        help='Attention mechanism type for decoder: sa (SpatialAttention) or cara (CARA)')
     
     # Loss function parameters
     parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2],

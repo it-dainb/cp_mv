@@ -6,7 +6,7 @@ from.effnetv2 import effnetv2_s
 from .frequency import FrequencyConvLayer
 
 class CMSegNet(nn.Module):
-    def __init__(self, attention_type='sa'):
+    def __init__(self, encoder_attention_type='sa', decoder_attention_type='sa'):
         """
         Args:
             attention_type: Type of attention mechanism to use ('sa' for SpatialAttention or 'cara' for CARA)
@@ -17,11 +17,11 @@ class CMSegNet(nn.Module):
         use_cara = False
         use_ela = False
         
-        if attention_type == 'sa':
+        if encoder_attention_type == 'sa':
             use_sa = True
-        elif attention_type == 'cara':
+        elif encoder_attention_type == 'cara':
             use_cara = True
-        elif attention_type == 'ela':
+        elif encoder_attention_type == 'ela':
             use_ela = True
         else:
             raise ValueError("Unsupported attention_type. Choose 'sa', 'cara', or 'ela'.")
@@ -32,13 +32,9 @@ class CMSegNet(nn.Module):
         {6: (24, 48), 10: (48, 64), 25: (64, 160), 41: (160, 1792)}
         '''
 
-        if attention_type == 'ela':
-            attention_type = 'sa'  # ELA is only used in the backbone, use 'sa' for decoders
-
         decoders = []
         for idx, (n_layer, (in_c, out_c)) in enumerate(self.backbone.ckpt_layers.items()):
-            decoders.append(DecoderBlock(in_c, out_c, use_cosa=idx != 0, attention_type=attention_type))
-
+            decoders.append(DecoderBlock(in_c, out_c, use_cosa=idx != 0, attention_type=decoder_attention_type))
             if idx == 0:
                 self.dconv = nn.ConvTranspose2d(out_c, in_c, 4, stride=4, padding=0)
                 self.conv_last = nn.Conv2d(in_c, 3, 1)
@@ -76,7 +72,7 @@ class CMSegNet(nn.Module):
 
 
 class CMFreqSegNet(nn.Module):
-    def __init__(self, attention_type='sa'):
+    def __init__(self, encoder_attention_type='sa', decoder_attention_type='sa'):
         """
         Frequency-enhanced variant of CMSegNet with FCL layers at bottleneck and skip connections.
         
@@ -89,11 +85,11 @@ class CMFreqSegNet(nn.Module):
         use_cara = False
         use_ela = False
         
-        if attention_type == 'sa':
+        if encoder_attention_type == 'sa':
             use_sa = True
-        elif attention_type == 'cara':
+        elif encoder_attention_type == 'cara':
             use_cara = True
-        elif attention_type == 'ela':
+        elif encoder_attention_type == 'ela':
             use_ela = True
         else:
             raise ValueError("Unsupported attention_type. Choose 'sa', 'cara', or 'ela'.")
@@ -114,7 +110,7 @@ class CMFreqSegNet(nn.Module):
 
         decoders = []
         for idx, (n_layer, (in_c, out_c)) in enumerate(self.backbone.ckpt_layers.items()):
-            decoders.append(DecoderBlock(in_c, out_c, use_cosa=idx != 0, attention_type=attention_type))
+            decoders.append(DecoderBlock(in_c, out_c, use_cosa=idx != 0, attention_type=decoder_attention_type))
 
             if idx == 0:
                 self.dconv = nn.ConvTranspose2d(out_c, in_c, 4, stride=4, padding=0)
