@@ -403,7 +403,6 @@ def main(args):
             'imgsz': args.imgsz,
             'scheduler': args.scheduler,
             'min_lr': args.min_lr,
-            'val_split': args.val_split,
             'seed': args.seed,
             'amp': args.amp,
             'compile': args.compile,
