@@ -12,8 +12,8 @@ import wandb
 
 from src.model import CMSegNet
 from src.loss import LossV2, LossV1
-from dataset import ForgeryDetectionDataset, create_balanced_splits, get_train_transforms, get_val_transforms, extract_instances_from_mask
-from competition_metrics import oF1_score, calculate_instance_metrics_from_masks
+from dataset import ForgeryDetectionDataset, get_train_transforms, get_val_transforms, extract_instances_from_mask, load_samples
+from competition_metrics import calculate_instance_metrics_from_masks
 
 
 class WarmupCosineScheduler:
@@ -509,15 +509,20 @@ def main(args):
         start_epoch, _ = load_checkpoint(model, optimizer, args.resume)
         start_epoch += 1
     
-    # Create balanced train/val splits
-    print("\nCreating balanced train/val splits...")
-    train_samples, val_samples = create_balanced_splits(
-        image_dir=args.train_images,
-        mask_dir=args.train_masks,
-        supplemental_image_dir=args.supplemental_images,
-        supplemental_mask_dir=args.supplemental_masks,
-        val_split=args.val_split,
-        random_seed=args.seed
+    # Load dataset splits
+    print("\nLoading preprocessed dataset...")
+    dataset_path = Path(args.dataset_path)
+    train_split_path = dataset_path / 'train_samples.json'
+    val_split_path = dataset_path / 'val_samples.json'
+
+    train_samples = load_samples(
+        train_split_path,
+        base_dir=dataset_path
+    )
+
+    val_samples = load_samples(
+        val_split_path,
+        base_dir=dataset_path
     )
     
     # Initialize datasets and dataloaders
@@ -654,14 +659,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train CMSegNet for segmentation')
     
     # Data parameters
-    parser.add_argument('--train-images', type=str, required=True, help='Path to training images')
-    parser.add_argument('--train-masks', type=str, required=True, help='Path to training masks')
-    parser.add_argument('--supplemental-images', type=str, default=None, 
-                        help='Path to supplemental images (optional, merged with training data)')
-    parser.add_argument('--supplemental-masks', type=str, default=None,
-                        help='Path to supplemental masks (optional, merged with training data)')
-    parser.add_argument('--val-split', type=float, default=0.2, 
-                        help='Fraction of data to use for validation (default: 0.2)')
+    parser.add_argument('--dataset-path', type=str, required=True, help='Path to the dataset')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--imgsz', type=int, default=512, help='Input image size (height and width)')
     
