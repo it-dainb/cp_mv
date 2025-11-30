@@ -690,8 +690,8 @@ if __name__ == '__main__':
     # Model parameters
     parser.add_argument('--model-mode', type=str, default='img', choices=['img', 'freq'],
                         help='Model mode: img (standard CMSegNet) or freq (frequency-enhanced)')
-    parser.add_argument('--attention-type', type=str, default='sa', choices=['sa', 'cara'],
-                        help='Attention mechanism type: sa (SpatialAttention) or cara (CARA)')
+    parser.add_argument('--attention-type', type=str, default='sa', choices=['sa', 'cara', 'ela'],
+                        help='Attention mechanism type: sa (SpatialAttention) or cara (CARA) or ela (ELAAttention)')
     
     # Loss function parameters
     parser.add_argument('--loss-version', type=int, default=1, choices=[1, 2],

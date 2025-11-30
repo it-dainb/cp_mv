@@ -12,12 +12,28 @@ class CMSegNet(nn.Module):
             attention_type: Type of attention mechanism to use ('sa' for SpatialAttention or 'cara' for CARA)
         """
         super(CMSegNet, self).__init__()
+
+        use_sa = False
+        use_cara = False
+        use_ela = False
         
-        self.backbone = effnetv2_s()
+        if attention_type == 'sa':
+            use_sa = True
+        elif attention_type == 'cara':
+            use_cara = True
+        elif attention_type == 'ela':
+            use_ela = True
+        else:
+            raise ValueError("Unsupported attention_type. Choose 'sa', 'cara', or 'ela'.")
+        
+        self.backbone = effnetv2_s(use_se=use_sa, use_ela=use_ela, use_cara=use_cara)
         '''
         Checkpoints feature map shapes:
         {6: (24, 48), 10: (48, 64), 25: (64, 160), 41: (160, 1792)}
         '''
+
+        if attention_type == 'ela':
+            attention_type = 'sa'  # ELA is only used in the backbone, use 'sa' for decoders
 
         decoders = []
         for idx, (n_layer, (in_c, out_c)) in enumerate(self.backbone.ckpt_layers.items()):
@@ -68,8 +84,21 @@ class CMFreqSegNet(nn.Module):
             attention_type: Type of attention mechanism to use ('sa' for SpatialAttention or 'cara' for CARA)
         """
         super(CMFreqSegNet, self).__init__()
+
+        use_sa = False
+        use_cara = False
+        use_ela = False
         
-        self.backbone = effnetv2_s()
+        if attention_type == 'sa':
+            use_sa = True
+        elif attention_type == 'cara':
+            use_cara = True
+        elif attention_type == 'ela':
+            use_ela = True
+        else:
+            raise ValueError("Unsupported attention_type. Choose 'sa', 'cara', or 'ela'.")
+        
+        self.backbone = effnetv2_s(use_se=use_sa, use_ela=use_ela, use_cara=use_cara)
         '''
         Checkpoints feature map shapes:
         {6: (24, 48), 10: (48, 64), 25: (64, 160), 41: (160, 1792)}
