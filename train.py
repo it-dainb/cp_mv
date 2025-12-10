@@ -844,31 +844,16 @@ def main(args):
 
         # Auto-set decay for progressive augmentation if not specified
         lr_decay = args.lr_decay
-        if args.progressive_aug and args.lr_decay == 1.0:  # 1.0 is the default
-            lr_decay = 0.75
-            print_rank0(f"Progressive aug detected: auto-setting lr_decay = {lr_decay}")
-
-        if lr_decay < 1.0:
-            print_rank0(
-                f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {args.t_mult}, decay: {lr_decay})"
-            )
-            scheduler = CosineAnnealingWarmRestartsDecay(
-                optimizer,
-                T_0=t0,
-                T_mult=args.t_mult,
-                eta_min=scaled_min_lr,
-                decay=lr_decay,
-            )
-        else:
-            # No decay, use standard PyTorch scheduler
-            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-
-            print_rank0(
-                f"Using CosineAnnealingWarmRestarts (T_0: {t0}, T_mult: {args.t_mult})"
-            )
-            scheduler = CosineAnnealingWarmRestarts(
-                optimizer, T_0=t0, T_mult=args.t_mult, eta_min=scaled_min_lr
-            )
+        print_rank0(
+            f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {args.t_mult}, decay: {lr_decay})"
+        )
+        scheduler = CosineAnnealingWarmRestartsDecay(
+            optimizer,
+            T_0=t0,
+            T_mult=args.t_mult,
+            eta_min=scaled_min_lr,
+            decay=lr_decay,
+        )
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
 
