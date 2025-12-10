@@ -3,8 +3,11 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 import numpy as np
 from pathlib import Path
@@ -20,6 +23,81 @@ from dataset import (
     extract_instances_from_mask,
 )
 from competition_metrics import calculate_instance_metrics_from_masks
+
+
+# =============================================================================
+# Distributed Training Utilities
+# =============================================================================
+
+
+def is_distributed():
+    """Check if distributed training is enabled."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    """Get the rank of the current process."""
+    if not is_distributed():
+        return 0
+    return dist.get_rank()
+
+
+def get_world_size():
+    """Get the total number of processes."""
+    if not is_distributed():
+        return 1
+    return dist.get_world_size()
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """
+    Initialize distributed training environment.
+
+    This function is called when using torchrun/torch.distributed.launch.
+    Environment variables RANK, LOCAL_RANK, and WORLD_SIZE are set by the launcher.
+    """
+    if "RANK" not in os.environ:
+        # Not running in distributed mode
+        return False, 0, torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Get distributed info from environment (set by torchrun)
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    # Set the device for this process
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    # Initialize the process group
+    dist.init_process_group(
+        backend="nccl",  # Use NCCL for GPU training (fastest)
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+    )
+
+    # Synchronize all processes
+    dist.barrier()
+
+    return True, local_rank, device
+
+
+def cleanup_distributed():
+    """Clean up distributed training resources."""
+    if is_distributed():
+        dist.destroy_process_group()
+
+
+def print_rank0(*args, **kwargs):
+    """Print only on rank 0."""
+    if is_main_process():
+        print(*args, **kwargs)
 
 
 class WarmupCosineScheduler:
@@ -177,7 +255,7 @@ def train_one_epoch(
         "specificity": 0.0,
     }
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process())
 
     for batch_idx, (images, masks, case_ids) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
@@ -310,7 +388,9 @@ def validate(
     # For oF1 computation
     of1_scores = []
 
-    pbar = tqdm(dataloader, desc=f"{log_prefix.capitalize()}")
+    pbar = tqdm(
+        dataloader, desc=f"{log_prefix.capitalize()}", disable=not is_main_process()
+    )
 
     for batch_idx, (images, masks, case_ids) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
@@ -405,11 +485,14 @@ def validate(
     return result
 
 
-def save_checkpoint(model, optimizer, epoch, metrics, path):
-    """Save model checkpoint"""
+def save_checkpoint(model, optimizer, epoch, metrics, path, distributed=False):
+    """Save model checkpoint (handles DDP wrapped models)."""
+    # Get the underlying model if wrapped with DDP
+    model_to_save = model.module if distributed and hasattr(model, "module") else model
+
     checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_to_save.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
     }
@@ -417,30 +500,47 @@ def save_checkpoint(model, optimizer, epoch, metrics, path):
     print(f"Checkpoint saved to {path}")
 
 
-def load_checkpoint(model, optimizer, path):
-    """Load model checkpoint"""
-    checkpoint = torch.load(path)
-    model.load_state_dict(checkpoint["model_state_dict"])
+def load_checkpoint(model, optimizer, path, distributed=False):
+    """Load model checkpoint (handles DDP wrapped models)."""
+    checkpoint = torch.load(path, map_location="cpu")
+
+    # Get the underlying model if wrapped with DDP
+    model_to_load = model.module if distributed and hasattr(model, "module") else model
+    model_to_load.load_state_dict(checkpoint["model_state_dict"])
+
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     epoch = checkpoint["epoch"]
     metrics = checkpoint.get("metrics", {})
-    print(f"Checkpoint loaded from {path} (epoch {epoch})")
+    print_rank0(f"Checkpoint loaded from {path} (epoch {epoch})")
     return epoch, metrics
 
 
 def main(args):
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Setup distributed training (if using torchrun)
+    distributed, local_rank, device = setup_distributed()
+
+    if distributed:
+        print_rank0(f"Distributed training enabled: {get_world_size()} GPUs")
+        print_rank0(f"Process rank: {get_rank()}, Local rank: {local_rank}")
+    else:
+        print(f"Using device: {device}")
 
     # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    if is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
 
-    # Initialize wandb
-    if not args.no_wandb:
+    # Synchronize before proceeding (ensure output dir exists)
+    if distributed:
+        dist.barrier()
+
+    # Initialize wandb (only on main process)
+    if not args.no_wandb and is_main_process():
+        # Need to define dataset_path early for config
+        dataset_path = Path(args.dataset_path)
         config_dict = {
             "epochs": args.epochs,
             "batch_size": args.batch_size,
+            "effective_batch_size": args.batch_size * get_world_size(),
             "learning_rate": args.lr,
             "weight_decay": args.weight_decay,
             "imgsz": args.imgsz,
@@ -458,6 +558,8 @@ def main(args):
             "dice_weight": args.dice_weight,
             "dataset_path": args.dataset_path,
             "has_test_split": (dataset_path / "test_samples.json").exists(),
+            "distributed": distributed,
+            "world_size": get_world_size(),
         }
 
         # Add scheduler-specific parameters
@@ -493,14 +595,14 @@ def main(args):
         )
 
     # Initialize model
-    print("Initializing model...")
-    print(f"Using model mode: {args.model_mode}")
-    print(f"Using encoder attention type: {args.encoder_attention_type}")
-    print(f"Using decoder attention type: {args.decoder_attention_type}")
+    print_rank0("Initializing model...")
+    print_rank0(f"Using model mode: {args.model_mode}")
+    print_rank0(f"Using encoder attention type: {args.encoder_attention_type}")
+    print_rank0(f"Using decoder attention type: {args.decoder_attention_type}")
 
     # Determine input channels based on grayscale flag
     in_channels = 1 if args.grayscale else 3
-    print(
+    print_rank0(
         f"Using input channels: {in_channels} ({'grayscale' if args.grayscale else 'RGB'})"
     )
 
@@ -521,21 +623,26 @@ def main(args):
 
     model = model.to(device)
 
+    # Wrap model with DistributedDataParallel if using distributed training
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        print_rank0(f"Model wrapped with DistributedDataParallel")
+
     # Optional: Use torch.compile for PyTorch 2.0+ (significant speedup)
     if hasattr(torch, "compile") and args.compile:
-        print("Compiling model with torch.compile()...")
+        print_rank0("Compiling model with torch.compile()...")
         model = torch.compile(model)
 
-    # Watch model with wandb
-    if not args.no_wandb:
+    # Watch model with wandb (only on main process)
+    if not args.no_wandb and is_main_process():
         wandb.watch(model, log="all", log_freq=100)
 
     # Initialize loss function
     if args.loss_version == 1:
-        print("Using LossV1 (BCE + Dice)")
+        print_rank0("Using LossV1 (BCE + Dice)")
         criterion = LossV1(dice_weight=args.dice_weight, eps=1.0)
     elif args.loss_version == 2:
-        print("Using LossV2 (Focal + Dice + Boundary)")
+        print_rank0("Using LossV2 (Focal + Dice + Boundary)")
         criterion = LossV2(
             focal_weight=args.focal_weight,
             dice_weight=args.dice_weight,
@@ -548,29 +655,43 @@ def main(args):
     else:
         raise ValueError(f"Unknown loss version: {args.loss_version}")
 
-    # Initialize optimizer
+    # Scale learning rate for distributed training (linear scaling rule)
+    # When batch size increases by N, LR should also increase by N (or sqrt(N) for stability)
+    base_lr = args.lr
+    scaled_lr = base_lr * get_world_size()  # Linear scaling
+    scaled_min_lr = args.min_lr * get_world_size()
+    scaled_warmup_start_lr = args.warmup_start_lr * get_world_size()
+
+    if distributed:
+        print_rank0(
+            f"Learning rate scaling: {base_lr:.2e} x {get_world_size()} GPUs = {scaled_lr:.2e}"
+        )
+
+    # Initialize optimizer with scaled learning rate
     optimizer = optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.parameters(), lr=scaled_lr, weight_decay=args.weight_decay
     )
 
-    # Learning rate scheduler
+    # Learning rate scheduler (use scaled values)
     if args.scheduler == "warmup_cosine":
-        print(f"Using WarmupCosineScheduler (warmup: {args.warmup_epochs} epochs)")
+        print_rank0(
+            f"Using WarmupCosineScheduler (warmup: {args.warmup_epochs} epochs)"
+        )
         scheduler = WarmupCosineScheduler(
             optimizer,
             warmup_epochs=args.warmup_epochs,
             max_epochs=args.epochs,
-            warmup_start_lr=args.warmup_start_lr,
-            eta_min=args.min_lr,
+            warmup_start_lr=scaled_warmup_start_lr,
+            eta_min=scaled_min_lr,
         )
     elif args.scheduler == "cosine_restarts":
-        print(
+        print_rank0(
             f"Using CosineAnnealingWarmRestarts (T_0: {args.t0}, T_mult: {args.t_mult})"
         )
         from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
         scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.min_lr
+            optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=scaled_min_lr
         )
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
@@ -581,11 +702,11 @@ def main(args):
     # Load checkpoint if specified
     start_epoch = 0
     if args.resume:
-        start_epoch, _ = load_checkpoint(model, optimizer, args.resume)
+        start_epoch, _ = load_checkpoint(model, optimizer, args.resume, distributed)
         start_epoch += 1
 
     # Load preprocessed splits from dataset directory
-    print("\nLoading preprocessed dataset...")
+    print_rank0("\nLoading preprocessed dataset...")
     dataset_path = Path(args.dataset_path)
     train_split_path = dataset_path / "train_samples.json"
     val_split_path = dataset_path / "val_samples.json"
@@ -596,8 +717,7 @@ def main(args):
     if not val_split_path.exists():
         raise FileNotFoundError(f"Val split not found: {val_split_path}")
 
-    print(f"  Dataset path: {dataset_path}")
-    print(f"  Loading: {train_split_path.name}, {val_split_path.name}", end="")
+    print_rank0(f"  Dataset path: {dataset_path}")
 
     # Pass dataset_path as base_dir to resolve relative paths
     train_samples = load_samples(train_split_path, base_dir=dataset_path)
@@ -606,29 +726,33 @@ def main(args):
     # Load test split if exists (optional for backward compatibility)
     test_samples = None
     if test_split_path.exists():
-        print(f", {test_split_path.name}")
+        print_rank0(
+            f"  Loading: {train_split_path.name}, {val_split_path.name}, {test_split_path.name}"
+        )
         test_samples = load_samples(test_split_path, base_dir=dataset_path)
     else:
-        print(" (no test split found)")
+        print_rank0(
+            f"  Loading: {train_split_path.name}, {val_split_path.name} (no test split found)"
+        )
 
     forged_count_train = sum(1 for s in train_samples if s["is_forged"])
     forged_count_val = sum(1 for s in val_samples if s["is_forged"])
-    print(f"\n=== Loaded Split Summary ===")
-    print(f"Train: {len(train_samples)} total")
-    print(f"  - Forged: {forged_count_train}")
-    print(f"  - Authentic: {len(train_samples) - forged_count_train}")
-    print(f"Val: {len(val_samples)} total")
-    print(f"  - Forged: {forged_count_val}")
-    print(f"  - Authentic: {len(val_samples) - forged_count_val}")
+    print_rank0(f"\n=== Loaded Split Summary ===")
+    print_rank0(f"Train: {len(train_samples)} total")
+    print_rank0(f"  - Forged: {forged_count_train}")
+    print_rank0(f"  - Authentic: {len(train_samples) - forged_count_train}")
+    print_rank0(f"Val: {len(val_samples)} total")
+    print_rank0(f"  - Forged: {forged_count_val}")
+    print_rank0(f"  - Authentic: {len(val_samples) - forged_count_val}")
     if test_samples is not None:
         forged_count_test = sum(1 for s in test_samples if s["is_forged"])
-        print(f"Test: {len(test_samples)} total")
-        print(f"  - Forged: {forged_count_test}")
-        print(f"  - Authentic: {len(test_samples) - forged_count_test}")
-    print("=" * 30)
+        print_rank0(f"Test: {len(test_samples)} total")
+        print_rank0(f"  - Forged: {forged_count_test}")
+        print_rank0(f"  - Authentic: {len(test_samples) - forged_count_test}")
+    print_rank0("=" * 30)
 
-    # Update wandb config with split sizes
-    if not args.no_wandb:
+    # Update wandb config with split sizes (only on main process)
+    if not args.no_wandb and is_main_process():
         wandb.config.update(
             {
                 "train_samples": len(train_samples),
@@ -641,18 +765,18 @@ def main(args):
         )
 
     # Initialize datasets and dataloaders
-    print(f"\nUsing augmentation level: {args.aug_level}")
+    print_rank0(f"\nUsing augmentation level: {args.aug_level}")
     if args.aug_level == 0:
-        print("  → No augmentation (normalize only)")
+        print_rank0("  → No augmentation (normalize only)")
     elif args.aug_level == 1:
-        print("  → Light: flips + small brightness/contrast")
+        print_rank0("  → Light: flips + small brightness/contrast")
     elif args.aug_level == 2:
-        print("  → Medium: + shift/scale/rotate + noise + CLAHE")
+        print_rank0("  → Medium: + shift/scale/rotate + noise + CLAHE")
     elif args.aug_level == 3:
-        print("  → Strong: + blur + elastic + coarse dropout")
+        print_rank0("  → Strong: + blur + elastic + coarse dropout")
 
     if args.grayscale:
-        print("  → Grayscale mode: ON (1 channel input)")
+        print_rank0("  → Grayscale mode: ON (1 channel input)")
 
     train_dataset = ForgeryDetectionDataset(
         samples=train_samples,
@@ -672,19 +796,36 @@ def main(args):
         grayscale=args.grayscale,
     )
 
+    # Create distributed samplers if using DDP
+    train_sampler = None
+    val_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=False
+        )
+        print_rank0(
+            f"Using DistributedSampler for data sharding across {get_world_size()} GPUs"
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # Only shuffle if not using sampler
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
+        drop_last=True if distributed else False,  # Drop last incomplete batch for DDP
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
@@ -692,6 +833,7 @@ def main(args):
 
     # Create test dataloader if test split exists
     test_loader = None
+    test_sampler = None
     if test_samples is not None:
         test_dataset = ForgeryDetectionDataset(
             samples=test_samples,
@@ -701,23 +843,41 @@ def main(args):
             grayscale=args.grayscale,
         )
 
+        if distributed:
+            test_sampler = DistributedSampler(
+                test_dataset,
+                num_replicas=get_world_size(),
+                rank=get_rank(),
+                shuffle=False,
+            )
+
         test_loader = DataLoader(
             test_dataset,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=test_sampler,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=True if args.num_workers > 0 else False,
         )
-        print(f"Test dataloader: {len(test_loader)} batches")
+        print_rank0(f"Test dataloader: {len(test_loader)} batches")
 
     # Training loop
     best_iou = 0.0
 
-    print(f"\nStarting training from epoch {start_epoch}...")
+    print_rank0(f"\nStarting training from epoch {start_epoch}...")
+    if distributed:
+        print_rank0(
+            f"Effective batch size: {args.batch_size * get_world_size()} ({args.batch_size} x {get_world_size()} GPUs)"
+        )
+
     for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch}/{args.epochs - 1}")
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
+        # Set epoch for distributed sampler (ensures different shuffling each epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        print_rank0(f"\nEpoch {epoch}/{args.epochs - 1}")
+        print_rank0(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
 
         # Train
         train_metrics = train_one_epoch(
@@ -729,26 +889,26 @@ def main(args):
             scheduler,
             device,
             epoch,
-            log_wandb=(not args.no_wandb),
+            log_wandb=(not args.no_wandb and is_main_process()),
             loss_version=args.loss_version,
         )
 
         # Print loss components
         if args.loss_version == 1:
-            print(
+            print_rank0(
                 f"Train - Loss: {train_metrics['loss']:.4f}, "
                 f"Dice: {train_metrics['loss_component1']:.4f}, "
                 f"BCE: {train_metrics['loss_component2']:.4f}"
             )
         else:
-            print(
+            print_rank0(
                 f"Train - Loss: {train_metrics['loss']:.4f}, "
                 f"Focal: {train_metrics['loss_component1']:.4f}, "
                 f"Dice: {train_metrics['loss_component2']:.4f}, "
                 f"Boundary: {train_metrics['loss_component3']:.4f}"
             )
 
-        print(
+        print_rank0(
             f"        mIoU: {train_metrics['iou']:.4f}, "
             f"mF1: {train_metrics['f1']:.4f}, "
             f"Prec: {train_metrics['precision']:.4f}, "
@@ -764,20 +924,20 @@ def main(args):
             criterion,
             device,
             compute_of1=compute_of1,
-            log_wandb=(not args.no_wandb),
+            log_wandb=(not args.no_wandb and is_main_process()),
             epoch=epoch,
             loss_version=args.loss_version,
         )
 
         # Print loss components
         if args.loss_version == 1:
-            print(
+            print_rank0(
                 f"Val   - Loss: {val_metrics['loss']:.4f}, "
                 f"Dice: {val_metrics['loss_component1']:.4f}, "
                 f"BCE: {val_metrics['loss_component2']:.4f}"
             )
         else:
-            print(
+            print_rank0(
                 f"Val   - Loss: {val_metrics['loss']:.4f}, "
                 f"Focal: {val_metrics['loss_component1']:.4f}, "
                 f"Dice: {val_metrics['loss_component2']:.4f}, "
@@ -793,7 +953,7 @@ def main(args):
         )
         if "oF1" in val_metrics:
             print_str += f", oF1: {val_metrics['oF1']:.4f}"
-        print(print_str)
+        print_rank0(print_str)
 
         # Update learning rate
         if args.scheduler == "warmup_cosine":
@@ -802,43 +962,54 @@ def main(args):
             # CosineAnnealingWarmRestarts steps after each epoch
             scheduler.step()
 
-        # Log learning rate to wandb
-        if not args.no_wandb:
+        # Log learning rate to wandb (only on main process)
+        if not args.no_wandb and is_main_process():
             wandb.log(
                 {"learning_rate": optimizer.param_groups[0]["lr"], "epoch": epoch}
             )
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_freq == 0:
+        # Save checkpoint (only on main process)
+        if is_main_process() and (epoch + 1) % args.save_freq == 0:
             checkpoint_path = os.path.join(
                 args.output_dir, f"checkpoint_epoch_{epoch}.pth"
             )
-            save_checkpoint(model, optimizer, epoch, val_metrics, checkpoint_path)
+            save_checkpoint(
+                model, optimizer, epoch, val_metrics, checkpoint_path, distributed
+            )
 
         # Save best model based on oF1 score (if available) or F1 score
         metric_key = "oF1" if "oF1" in val_metrics else "f1"
         if val_metrics[metric_key] > best_iou:
             best_iou = val_metrics[metric_key]
             best_path = os.path.join(args.output_dir, "best_model.pth")
-            save_checkpoint(model, optimizer, epoch, val_metrics, best_path)
-            print(
-                f"New best model saved! {metric_key}: {best_iou:.4f}, IoU: {val_metrics['iou']:.4f}"
-            )
 
-            # Log best model to wandb
-            if not args.no_wandb:
-                wandb.run.summary[f"best_{metric_key}"] = best_iou
-                wandb.run.summary["best_iou"] = val_metrics["iou"]
-                # Save model artifact
-                artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
-                artifact.add_file(best_path)
-                wandb.log_artifact(artifact)
+            # Only save on main process
+            if is_main_process():
+                save_checkpoint(
+                    model, optimizer, epoch, val_metrics, best_path, distributed
+                )
+                print(
+                    f"New best model saved! {metric_key}: {best_iou:.4f}, IoU: {val_metrics['iou']:.4f}"
+                )
 
-    print("\nTraining completed!")
-    print(f"Best validation score: {best_iou:.4f}")
+                # Log best model to wandb
+                if not args.no_wandb:
+                    wandb.run.summary[f"best_{metric_key}"] = best_iou
+                    wandb.run.summary["best_iou"] = val_metrics["iou"]
+                    # Save model artifact
+                    artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
+                    artifact.add_file(best_path)
+                    wandb.log_artifact(artifact)
 
-    # Final test evaluation (if test set exists)
-    if test_loader is not None:
+        # Synchronize all processes before next epoch
+        if distributed:
+            dist.barrier()
+
+    print_rank0("\nTraining completed!")
+    print_rank0(f"Best validation score: {best_iou:.4f}")
+
+    # Final test evaluation (if test set exists) - only on main process for simplicity
+    if test_loader is not None and is_main_process():
         print("\n" + "=" * 50)
         print("Running final evaluation on TEST set...")
         print("=" * 50)
@@ -847,8 +1018,12 @@ def main(args):
         best_model_path = os.path.join(args.output_dir, "best_model.pth")
         if os.path.exists(best_model_path):
             print(f"Loading best model from {best_model_path}")
-            checkpoint = torch.load(best_model_path)
-            model.load_state_dict(checkpoint["model_state_dict"])
+            checkpoint = torch.load(best_model_path, map_location=device)
+            # Get the underlying model if wrapped with DDP
+            model_to_load = (
+                model.module if distributed and hasattr(model, "module") else model
+            )
+            model_to_load.load_state_dict(checkpoint["model_state_dict"])
         else:
             print("Best model not found, using final model weights")
 
@@ -902,9 +1077,12 @@ def main(args):
             if "oF1" in test_metrics:
                 wandb.run.summary["test/oF1"] = test_metrics["oF1"]
 
-    # Finish wandb run
-    if not args.no_wandb:
+    # Finish wandb run (only on main process)
+    if not args.no_wandb and is_main_process():
         wandb.finish()
+
+    # Cleanup distributed training
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
