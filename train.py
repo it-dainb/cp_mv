@@ -573,7 +573,6 @@ def main(args):
             "learning_rate": args.lr,
             "weight_decay": args.weight_decay,
             "imgsz": args.imgsz,
-            "aug_level": args.aug_level,
             "progressive_aug": args.progressive_aug,
             "grayscale": args.grayscale,
             "scheduler": args.scheduler,
@@ -812,7 +811,7 @@ def main(args):
         print_rank0(f"  Training will progress through aug levels 0 → 3")
         print_rank0(f"  Starting at level {current_aug_level} (epoch {start_epoch})")
     else:
-        current_aug_level = args.aug_level
+        current_aug_level = 0
         print_rank0(f"\nUsing fixed augmentation level: {current_aug_level}")
 
     # Print aug level description
@@ -1228,13 +1227,6 @@ if __name__ == "__main__":
     )
 
     # Augmentation parameters
-    parser.add_argument(
-        "--aug-level",
-        type=int,
-        default=0,
-        choices=[0, 1, 2, 3],
-        help="Online augmentation level: 0=none, 1=light (flips), 2=medium (+noise/rotate), 3=strong (+elastic/dropout)",
-    )
     parser.add_argument(
         "--progressive-aug",
         action="store_true",
