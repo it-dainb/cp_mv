@@ -1,6 +1,7 @@
 import os
 import gc
 import argparse
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,6 +14,43 @@ from tqdm.auto import tqdm
 import numpy as np
 from pathlib import Path
 import wandb
+
+
+def set_seed(seed: int):
+    """
+    Set random seeds for reproducibility across Python, NumPy, and PyTorch.
+
+    This ensures that:
+    - Data shuffling is reproducible
+    - Data augmentation randomness is reproducible
+    - Model weight initialization is reproducible
+    - Dropout and other stochastic layers behave consistently
+
+    Args:
+        seed: Random seed value
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # For full determinism (may reduce performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    """
+    Worker init function for DataLoader to ensure reproducibility.
+
+    Each worker needs its own seed derived from the base seed to ensure
+    reproducible data loading across multiple workers.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 from src.model import CMSegNet, CMFreqSegNet
 from src.loss import LossV2, LossV1
@@ -645,6 +683,10 @@ def load_checkpoint(model, optimizer, path, distributed=False):
 
 
 def main(args):
+    # Set random seeds for reproducibility
+    set_seed(args.seed)
+    print(f"Random seed set to {args.seed} for reproducibility")
+
     # Setup distributed training (if using torchrun)
     distributed, local_rank, device = setup_distributed()
 
@@ -967,7 +1009,12 @@ def main(args):
                 num_replicas=get_world_size(),
                 rank=get_rank(),
                 shuffle=True,
+                seed=args.seed,
             )
+
+        # Create a seeded generator for reproducible shuffling
+        g = torch.Generator()
+        g.manual_seed(args.seed)
 
         train_loader = DataLoader(
             train_dataset,
@@ -978,6 +1025,8 @@ def main(args):
             pin_memory=True,
             persistent_workers=True if args.num_workers > 0 else False,
             drop_last=True if distributed else False,
+            worker_init_fn=seed_worker,
+            generator=g,
         )
         return train_loader, train_sampler
 
@@ -996,8 +1045,16 @@ def main(args):
     val_sampler = None
     if distributed:
         val_sampler = DistributedSampler(
-            val_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=False
+            val_dataset,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=False,
+            seed=args.seed,
         )
+
+    # Create a seeded generator for reproducible data loading
+    g_val = torch.Generator()
+    g_val.manual_seed(args.seed)
 
     val_loader = DataLoader(
         val_dataset,
@@ -1007,6 +1064,8 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
+        worker_init_fn=seed_worker,
+        generator=g_val,
     )
 
     # Create test dataloader if test split exists
@@ -1027,7 +1086,12 @@ def main(args):
                 num_replicas=get_world_size(),
                 rank=get_rank(),
                 shuffle=False,
+                seed=args.seed,
             )
+
+        # Create a seeded generator for reproducible data loading
+        g_test = torch.Generator()
+        g_test.manual_seed(args.seed)
 
         test_loader = DataLoader(
             test_dataset,
@@ -1037,6 +1101,8 @@ def main(args):
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=True if args.num_workers > 0 else False,
+            worker_init_fn=seed_worker,
+            generator=g_test,
         )
         print_rank0(f"Test dataloader: {len(test_loader)} batches")
 
