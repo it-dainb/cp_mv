@@ -502,7 +502,7 @@ def save_checkpoint(model, optimizer, epoch, metrics, path, distributed=False):
 
 def load_checkpoint(model, optimizer, path, distributed=False):
     """Load model checkpoint (handles DDP wrapped models)."""
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
     # Get the underlying model if wrapped with DDP
     model_to_load = model.module if distributed and hasattr(model, "module") else model
@@ -1028,7 +1028,9 @@ def main(args):
         best_model_path = os.path.join(args.output_dir, "best_model.pth")
         if os.path.exists(best_model_path):
             print(f"Loading best model from {best_model_path}")
-            checkpoint = torch.load(best_model_path, map_location=device)
+            checkpoint = torch.load(
+                best_model_path, map_location=device, weights_only=False
+            )
             # Get the underlying model if wrapped with DDP
             model_to_load = (
                 model.module if distributed and hasattr(model, "module") else model
