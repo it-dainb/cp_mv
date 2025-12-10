@@ -624,9 +624,19 @@ def main(args):
     model = model.to(device)
 
     # Wrap model with DistributedDataParallel if using distributed training
+    # find_unused_parameters=True is needed because:
+    # - img mode doesn't use frequency branch parameters
+    # - freq mode may have unused parameters in certain paths
     if distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        print_rank0(f"Model wrapped with DistributedDataParallel")
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        print_rank0(
+            "Model wrapped with DistributedDataParallel (find_unused_parameters=True)"
+        )
 
     # Optional: Use torch.compile for PyTorch 2.0+ (significant speedup)
     if hasattr(torch, "compile") and args.compile:
