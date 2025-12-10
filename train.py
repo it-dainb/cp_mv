@@ -1052,12 +1052,21 @@ def main(args):
         test_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         torch.cuda.empty_cache()
 
-        # Create fresh model for test evaluation
+        # Create fresh model for test evaluation (same config as training)
         print("Creating fresh model for test evaluation...")
-        test_model = CMSegNet(
-            num_classes=1,
-            input_mode=args.input_mode,
-        )
+        test_in_channels = 1 if args.grayscale else 3
+        if args.model_mode == "img":
+            test_model = CMSegNet(
+                encoder_attention_type=args.encoder_attention_type,
+                decoder_attention_type=args.decoder_attention_type,
+                in_channels=test_in_channels,
+            )
+        else:
+            test_model = CMFreqSegNet(
+                encoder_attention_type=args.encoder_attention_type,
+                decoder_attention_type=args.decoder_attention_type,
+                in_channels=test_in_channels,
+            )
 
         # Load best checkpoint
         print(f"Loading best model from {best_model_path}")
