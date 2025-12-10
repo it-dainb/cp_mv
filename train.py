@@ -173,6 +173,101 @@ class WarmupCosineScheduler:
         pass
 
 
+class CosineAnnealingWarmRestartsDecay:
+    """
+    Cosine annealing scheduler with warm restarts and optional LR decay.
+
+    Similar to PyTorch's CosineAnnealingWarmRestarts but with decay factor
+    that reduces the max LR after each restart. This is useful for progressive
+    augmentation where early phases need high LR and later phases benefit from
+    more stable, lower LR.
+
+    Args:
+        optimizer: Wrapped optimizer
+        T_0: Number of epochs for the first restart cycle
+        T_mult: Factor to increase cycle length after each restart (default: 1)
+        eta_min: Minimum learning rate (default: 1e-6)
+        decay: Factor to multiply max LR after each restart (default: 1.0, no decay)
+               e.g., decay=0.8 means max LR becomes 80% after each restart
+
+    Example with T_0=25, decay=0.8, base_lr=1e-4:
+        Epochs 0-24:   LR: 1e-4 → 1e-6
+        Epochs 25-49:  LR: 8e-5 → 1e-6  (decayed by 0.8)
+        Epochs 50-74:  LR: 6.4e-5 → 1e-6  (decayed by 0.8^2)
+        Epochs 75-99:  LR: 5.1e-5 → 1e-6  (decayed by 0.8^3)
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        T_0,
+        T_mult=1,
+        eta_min=1e-6,
+        decay=1.0,
+        last_epoch=-1,
+    ):
+        self.optimizer = optimizer
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.eta_min = eta_min
+        self.decay = decay
+        self.last_epoch = last_epoch
+
+        # Store base learning rates
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+
+        # Track current cycle
+        self.T_cur = 0  # Current position in cycle
+        self.T_i = T_0  # Current cycle length
+        self.cycle = 0  # Current cycle number
+
+    def get_lr(self):
+        """Calculate learning rate for current epoch"""
+        # Calculate decay factor based on cycle number
+        decay_factor = self.decay**self.cycle
+
+        # Cosine annealing within current cycle
+        lrs = [
+            self.eta_min
+            + (base_lr * decay_factor - self.eta_min)
+            * 0.5
+            * (1 + np.cos(np.pi * self.T_cur / self.T_i))
+            for base_lr in self.base_lrs
+        ]
+        return lrs
+
+    def step(self, epoch=None):
+        """Update learning rate"""
+        if epoch is None:
+            epoch = self.last_epoch + 1
+        self.last_epoch = epoch
+
+        # Determine which cycle we're in and position within cycle
+        if epoch >= self.T_0:
+            if self.T_mult == 1:
+                self.cycle = epoch // self.T_0
+                self.T_cur = epoch % self.T_0
+                self.T_i = self.T_0
+            else:
+                # Handle T_mult > 1 (increasing cycle lengths)
+                n = int(
+                    np.log((epoch / self.T_0 * (self.T_mult - 1) + 1))
+                    / np.log(self.T_mult)
+                )
+                self.cycle = n
+                self.T_cur = epoch - self.T_0 * (self.T_mult**n - 1) // (
+                    self.T_mult - 1
+                )
+                self.T_i = self.T_0 * self.T_mult**n
+        else:
+            self.T_cur = epoch
+            self.cycle = 0
+
+        lrs = self.get_lr()
+        for param_group, lr in zip(self.optimizer.param_groups, lrs):
+            param_group["lr"] = lr
+
+
 def get_progressive_aug_level(epoch: int, total_epochs: int, max_level: int = 3) -> int:
     """
     Calculate augmentation level for progressive/curriculum learning.
@@ -604,6 +699,7 @@ def main(args):
                 {
                     "t0": args.t0,
                     "t_mult": args.t_mult,
+                    "lr_decay": args.lr_decay,
                 }
             )
 
@@ -740,14 +836,34 @@ def main(args):
             print_rank0(
                 f"\nProgressive aug detected: auto-setting T_0 = epochs/4 = {t0}"
             )
-        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
-        print_rank0(
-            f"Using CosineAnnealingWarmRestarts (T_0: {t0}, T_mult: {args.t_mult})"
-        )
-        scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=t0, T_mult=args.t_mult, eta_min=scaled_min_lr
-        )
+        # Auto-set decay for progressive augmentation if not specified
+        lr_decay = args.lr_decay
+        if args.progressive_aug and args.lr_decay == 1.0:  # 1.0 is the default
+            lr_decay = 0.75
+            print_rank0(f"Progressive aug detected: auto-setting lr_decay = {lr_decay}")
+
+        if lr_decay < 1.0:
+            print_rank0(
+                f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {args.t_mult}, decay: {lr_decay})"
+            )
+            scheduler = CosineAnnealingWarmRestartsDecay(
+                optimizer,
+                T_0=t0,
+                T_mult=args.t_mult,
+                eta_min=scaled_min_lr,
+                decay=lr_decay,
+            )
+        else:
+            # No decay, use standard PyTorch scheduler
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+            print_rank0(
+                f"Using CosineAnnealingWarmRestarts (T_0: {t0}, T_mult: {args.t_mult})"
+            )
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=t0, T_mult=args.t_mult, eta_min=scaled_min_lr
+            )
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
 
@@ -1359,6 +1475,12 @@ if __name__ == "__main__":
         type=int,
         default=2,
         help="Factor to increase cycle length after restart (cosine_restarts only)",
+    )
+    parser.add_argument(
+        "--lr-decay",
+        type=float,
+        default=1.0,
+        help="LR decay factor after each restart (cosine_restarts only). e.g., 0.8 means max LR becomes 80%% after each restart. Default 1.0 (no decay).",
     )
 
     # Optimization parameters
