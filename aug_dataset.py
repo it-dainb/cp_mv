@@ -287,9 +287,54 @@ class CopyMoveAugmentor:
         return obj_img, obj_mask, bbox
 
     def apply_transforms(self, obj_img: np.ndarray, obj_mask: np.ndarray) -> tuple:
-        """Apply geometric transforms to object."""
-        transformed = self._geo_transform(image=obj_img, mask=obj_mask)
-        return transformed["image"], transformed["mask"]
+        """Apply geometric transforms to object with padding to prevent clipping."""
+        h, w = obj_mask.shape[:2]
+
+        # Calculate padding needed for worst-case rotation (diagonal of bounding box)
+        # When rotated 45 degrees, the diagonal becomes the new width/height
+        diagonal = int(np.ceil(np.sqrt(h * h + w * w)))
+        pad_h = (diagonal - h) // 2 + 10  # Extra margin
+        pad_w = (diagonal - w) // 2 + 10
+
+        # Pad the image and mask with zeros (black/transparent)
+        padded_img = np.pad(
+            obj_img,
+            ((pad_h, pad_h), (pad_w, pad_w), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+        padded_mask = np.pad(
+            obj_mask,
+            ((pad_h, pad_h), (pad_w, pad_w)),
+            mode="constant",
+            constant_values=0,
+        )
+
+        # Apply transforms on padded image/mask
+        transformed = self._geo_transform(image=padded_img, mask=padded_mask)
+        trans_img = transformed["image"]
+        trans_mask = transformed["mask"]
+
+        # Crop back to content bounding box (remove excess padding)
+        coords = np.where(trans_mask > 0)
+        if len(coords[0]) == 0:
+            # No valid mask after transform, return original
+            return obj_img, obj_mask
+
+        y_min, y_max = coords[0].min(), coords[0].max() + 1
+        x_min, x_max = coords[1].min(), coords[1].max() + 1
+
+        # Add small padding around the cropped content
+        margin = 2
+        y_min = max(0, y_min - margin)
+        y_max = min(trans_mask.shape[0], y_max + margin)
+        x_min = max(0, x_min - margin)
+        x_max = min(trans_mask.shape[1], x_max + margin)
+
+        cropped_img = trans_img[y_min:y_max, x_min:x_max]
+        cropped_mask = trans_mask[y_min:y_max, x_min:x_max]
+
+        return cropped_img, cropped_mask
 
     def find_valid_position(
         self,
