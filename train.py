@@ -1,4 +1,5 @@
 import os
+import gc
 import argparse
 import torch
 import torch.nn as nn
@@ -1018,32 +1019,63 @@ def main(args):
     print_rank0("\nTraining completed!")
     print_rank0(f"Best validation score: {best_iou:.4f}")
 
-    # Final test evaluation (if test set exists) - only on main process for simplicity
-    if test_loader is not None and is_main_process():
+    # Check if we need to run test evaluation
+    has_test = test_loader is not None
+    best_model_path = os.path.join(args.output_dir, "best_model.pth")
+    has_best_model = os.path.exists(best_model_path)
+
+    # Cleanup distributed training and free memory BEFORE test evaluation
+    # This prevents OOM issues on multi-GPU setups
+    if distributed:
+        dist.barrier()  # Ensure all processes are done with training
+
+    # Delete training objects to free GPU memory
+    del model
+    del optimizer
+    del train_loader
+    del val_loader
+    if scheduler is not None:
+        del scheduler
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Cleanup distributed process group
+    cleanup_distributed()
+
+    # Final test evaluation - run only on main process with single GPU
+    if has_test and is_main_process() and has_best_model:
         print("\n" + "=" * 50)
         print("Running final evaluation on TEST set...")
         print("=" * 50)
 
-        # Load best model for test evaluation
-        best_model_path = os.path.join(args.output_dir, "best_model.pth")
-        if os.path.exists(best_model_path):
-            print(f"Loading best model from {best_model_path}")
-            checkpoint = torch.load(
-                best_model_path, map_location=device, weights_only=False
-            )
-            # Get the underlying model if wrapped with DDP
-            model_to_load = (
-                model.module if distributed and hasattr(model, "module") else model
-            )
-            model_to_load.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            print("Best model not found, using final model weights")
+        # Use cuda:0 for test evaluation (single GPU)
+        test_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        torch.cuda.empty_cache()
+
+        # Create fresh model for test evaluation
+        print("Creating fresh model for test evaluation...")
+        test_model = CMSegNet(
+            num_classes=1,
+            input_mode=args.input_mode,
+        )
+
+        # Load best checkpoint
+        print(f"Loading best model from {best_model_path}")
+        checkpoint = torch.load(
+            best_model_path, map_location=test_device, weights_only=False
+        )
+        test_model.load_state_dict(checkpoint["model_state_dict"])
+        test_model = test_model.to(test_device)
+        test_model.eval()
+
+        # Re-create test criterion
+        test_criterion = CombinedLoss(version=args.loss_version)
 
         test_metrics = validate(
-            model,
+            test_model,
             test_loader,
-            criterion,
-            device,
+            test_criterion,
+            test_device,
             compute_of1=True,  # Always compute oF1 for final test
             log_wandb=(not args.no_wandb),
             epoch=args.epochs,  # Use final epoch for logging
@@ -1089,12 +1121,17 @@ def main(args):
             if "oF1" in test_metrics:
                 wandb.run.summary["test/oF1"] = test_metrics["oF1"]
 
+        # Cleanup test model
+        del test_model
+        del test_criterion
+        torch.cuda.empty_cache()
+
+    elif has_test and is_main_process() and not has_best_model:
+        print("Best model not found, skipping test evaluation")
+
     # Finish wandb run (only on main process)
     if not args.no_wandb and is_main_process():
         wandb.finish()
-
-    # Cleanup distributed training
-    cleanup_distributed()
 
 
 if __name__ == "__main__":
