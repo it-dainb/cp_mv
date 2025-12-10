@@ -1,3 +1,5 @@
 __pycache__/
 .fuse*
 .ruff_cache/
+preprocessed/
+augmented/
