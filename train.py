@@ -276,6 +276,9 @@ def get_progressive_aug_level(epoch: int, total_epochs: int, max_level: int = 3)
     This helps the model learn basic features first, then gradually adapt to
     harder augmentations.
 
+    Uses integer division (total_epochs // num_phases) to align with LR scheduler
+    cycle boundaries when using cosine_restarts with T_0 = total_epochs // 4.
+
     Args:
         epoch: Current epoch (0-indexed)
         total_epochs: Total number of training epochs
@@ -291,8 +294,10 @@ def get_progressive_aug_level(epoch: int, total_epochs: int, max_level: int = 3)
         Epochs 75-99:  level 3 (strong augmentation)
     """
     num_phases = max_level + 1
-    epochs_per_phase = total_epochs / num_phases
-    current_level = int(epoch / epochs_per_phase)
+    epochs_per_phase = total_epochs // num_phases  # Integer division to align with T_0
+    if epochs_per_phase == 0:
+        epochs_per_phase = 1  # Safety for very short training
+    current_level = epoch // epochs_per_phase
     return min(current_level, max_level)
 
 
