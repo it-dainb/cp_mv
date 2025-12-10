@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from .attention import ELA_Base, CARA
 
-__all__ = ['effnetv2_s', 'effnetv2_m', 'effnetv2_l', 'effnetv2_xl']
+__all__ = ["effnetv2_s", "effnetv2_m", "effnetv2_l", "effnetv2_xl"]
 
 
 def _make_divisible(v, divisor, min_value=None):
@@ -27,7 +27,7 @@ def _make_divisible(v, divisor, min_value=None):
 
 
 # SiLU (Swish) activation function
-if hasattr(nn, 'SiLU'):
+if hasattr(nn, "SiLU"):
     SiLU = nn.SiLU
 else:
     # For compatibility with old PyTorch versions
@@ -35,16 +35,16 @@ else:
         def forward(self, x):
             return x * torch.sigmoid(x)
 
- 
+
 class SELayer(nn.Module):
     def __init__(self, inp, oup, reduction=4):
         super(SELayer, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-                nn.Linear(oup, _make_divisible(inp // reduction, 8)),
-                SiLU(),
-                nn.Linear(_make_divisible(inp // reduction, 8), oup),
-                nn.Sigmoid()
+            nn.Linear(oup, _make_divisible(inp // reduction, 8)),
+            SiLU(),
+            nn.Linear(_make_divisible(inp // reduction, 8), oup),
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -57,22 +57,27 @@ class SELayer(nn.Module):
 
 def conv_3x3_bn(inp, oup, stride):
     return nn.Sequential(
-        nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
-        nn.BatchNorm2d(oup),
-        SiLU()
+        nn.Conv2d(inp, oup, 3, stride, 1, bias=False), nn.BatchNorm2d(oup), SiLU()
     )
 
 
 def conv_1x1_bn(inp, oup):
     return nn.Sequential(
-        nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
-        nn.BatchNorm2d(oup),
-        SiLU()
+        nn.Conv2d(inp, oup, 1, 1, 0, bias=False), nn.BatchNorm2d(oup), SiLU()
     )
 
 
 class MBConv(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio, use_se=False, use_ela=False, use_cara=False):
+    def __init__(
+        self,
+        inp,
+        oup,
+        stride,
+        expand_ratio,
+        use_se=False,
+        use_ela=False,
+        use_cara=False,
+    ):
         super(MBConv, self).__init__()
         assert stride in [1, 2]
 
@@ -80,7 +85,9 @@ class MBConv(nn.Module):
         self.identity = stride == 1 and inp == oup
 
         if use_se + use_ela + use_cara > 1:
-            raise ValueError("MBConv: Only one of use_se, use_ela, use_cara can be True.")
+            raise ValueError(
+                "MBConv: Only one of use_se, use_ela, use_cara can be True."
+            )
 
         if use_se:
             self.conv = nn.Sequential(
@@ -89,7 +96,9 @@ class MBConv(nn.Module):
                 nn.BatchNorm2d(hidden_dim),
                 SiLU(),
                 # dw
-                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+                nn.Conv2d(
+                    hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False
+                ),
                 nn.BatchNorm2d(hidden_dim),
                 SiLU(),
                 SELayer(inp, hidden_dim),
@@ -104,7 +113,9 @@ class MBConv(nn.Module):
                 nn.BatchNorm2d(hidden_dim),
                 SiLU(),
                 # dw
-                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+                nn.Conv2d(
+                    hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False
+                ),
                 nn.BatchNorm2d(hidden_dim),
                 SiLU(),
                 ELA_Base(hidden_dim),
@@ -119,7 +130,9 @@ class MBConv(nn.Module):
                 nn.BatchNorm2d(hidden_dim),
                 SiLU(),
                 # dw
-                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+                nn.Conv2d(
+                    hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False
+                ),
                 nn.BatchNorm2d(hidden_dim),
                 SiLU(),
                 CARA(channels=hidden_dim, reduction_ratio=8),
@@ -127,7 +140,7 @@ class MBConv(nn.Module):
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                 nn.BatchNorm2d(oup),
             )
-        else: # Fused MBConv
+        else:  # Fused MBConv
             self.conv = nn.Sequential(
                 # fused
                 nn.Conv2d(inp, hidden_dim, 3, stride, 1, bias=False),
@@ -138,7 +151,6 @@ class MBConv(nn.Module):
                 nn.BatchNorm2d(oup),
             )
 
-
     def forward(self, x):
         if self.identity:
             return x + self.conv(x)
@@ -147,18 +159,42 @@ class MBConv(nn.Module):
 
 
 class EffNetV2(nn.Module):
-    def __init__(self, cfgs, output_channel=1792, width_mult=1., use_se=False, use_ela=False, use_cara=False):
+    def __init__(
+        self,
+        cfgs,
+        output_channel=1792,
+        width_mult=1.0,
+        use_se=False,
+        use_ela=False,
+        use_cara=False,
+        in_channels=3,
+    ):
+        """
+        Args:
+            cfgs: Model configuration (expansion, channels, num_blocks, stride)
+            output_channel: Output channel count for final layer
+            width_mult: Width multiplier for channels
+            use_se: Use Squeeze-and-Excitation attention
+            use_ela: Use ELA attention
+            use_cara: Use CARA attention
+            in_channels: Number of input channels (3 for RGB, 1 for grayscale)
+        """
         super(EffNetV2, self).__init__()
         self.cfgs = cfgs
+        self.in_channels = in_channels
 
         input_channel = _make_divisible(24 * width_mult, 8)
 
         self.input_channel = input_channel
-        self.output_channel = _make_divisible(output_channel * width_mult, 8) if width_mult > 1.0 else output_channel
+        self.output_channel = (
+            _make_divisible(output_channel * width_mult, 8)
+            if width_mult > 1.0
+            else output_channel
+        )
 
-        # building first layer
-        layers = [conv_3x3_bn(3, input_channel, 2)]
-        
+        # building first layer - accepts configurable input channels
+        layers = [conv_3x3_bn(in_channels, input_channel, 2)]
+
         # building inverted residual blocks
         block = MBConv
 
@@ -184,36 +220,43 @@ class EffNetV2(nn.Module):
             elif idx != 0:
                 prev_input_channel, _ = self.ckpt_layers[idx]
                 del self.ckpt_layers[idx]
-                
+
                 self.ckpt_layers[idx + n] = (prev_input_channel, output_channel)
 
             for i in range(n):
-                layers.append(block(input_channel, output_channel, s if i == 0 else 1, t, use_se, use_ela, use_cara))
+                layers.append(
+                    block(
+                        input_channel,
+                        output_channel,
+                        s if i == 0 else 1,
+                        t,
+                        use_se,
+                        use_ela,
+                        use_cara,
+                    )
+                )
                 input_channel = output_channel
 
             idx += n
-
 
         layers.append(conv_1x1_bn(input_channel, self.output_channel))
 
         # Add final output layer as checkpoint
         self.ckpt_layers[idx + 1] = (self.ckpt_layers[idx][0], self.output_channel)
         del self.ckpt_layers[idx]
-            
-        self.features = nn.Sequential(*layers)        
+
+        self.features = nn.Sequential(*layers)
 
         self._initialize_weights()
 
     def forward(self, x, return_ckpt=False):
-
         ckpt_outputs = []
         for idx, layer in enumerate(self.features):
-            
             x = layer(x)
-                        
+
             if idx in self.ckpt_layers and return_ckpt:
                 ckpt_outputs.append(x)
-        
+
         if return_ckpt:
             return ckpt_outputs
 
@@ -233,20 +276,25 @@ class EffNetV2(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
-def effnetv2_s(**kwargs):
+
+def effnetv2_s(in_channels=3, **kwargs):
     """
     Constructs a EfficientNetV2-S model
+
+    Args:
+        in_channels: Number of input channels (3 for RGB, 1 for grayscale)
+        **kwargs: Additional arguments passed to EffNetV2
     """
     cfgs = [
         # t, c, n, s
-        [1,  24,  2, 1],
-        [4,  48,  4, 2],
-        [4,  64,  4, 2],
-        [4, 128,  6, 2],
-        [6, 160,  9, 1],
+        [1, 24, 2, 1],
+        [4, 48, 4, 2],
+        [4, 64, 4, 2],
+        [4, 128, 6, 2],
+        [6, 160, 9, 1],
         [6, 256, 15, 2],
     ]
-    return EffNetV2(cfgs, **kwargs)
+    return EffNetV2(cfgs, in_channels=in_channels, **kwargs)
 
 
 def effnetv2_m(**kwargs):
@@ -255,13 +303,13 @@ def effnetv2_m(**kwargs):
     """
     cfgs = [
         # t, c, n, s
-        [1,  24,  3, 1],
-        [4,  48,  5, 2],
-        [4,  80,  5, 2],
-        [4, 160,  7, 2],
+        [1, 24, 3, 1],
+        [4, 48, 5, 2],
+        [4, 80, 5, 2],
+        [4, 160, 7, 2],
         [6, 176, 14, 1],
         [6, 304, 18, 2],
-        [6, 512,  5, 1],
+        [6, 512, 5, 1],
     ]
     return EffNetV2(cfgs, **kwargs)
 
@@ -272,13 +320,13 @@ def effnetv2_l(**kwargs):
     """
     cfgs = [
         # t, c, n, s
-        [1,  32,  4, 1],
-        [4,  64,  7, 2],
-        [4,  96,  7, 2],
+        [1, 32, 4, 1],
+        [4, 64, 7, 2],
+        [4, 96, 7, 2],
         [4, 192, 10, 2],
         [6, 224, 19, 1],
         [6, 384, 25, 2],
-        [6, 640,  7, 1],
+        [6, 640, 7, 1],
     ]
     return EffNetV2(cfgs, **kwargs)
 
@@ -289,12 +337,12 @@ def effnetv2_xl(**kwargs):
     """
     cfgs = [
         # t, c, n, s
-        [1,  32,  4, 1],
-        [4,  64,  8, 2],
-        [4,  96,  8, 2],
+        [1, 32, 4, 1],
+        [4, 64, 8, 2],
+        [4, 96, 8, 2],
         [4, 192, 16, 2],
         [6, 256, 24, 1],
         [6, 512, 32, 2],
-        [6, 640,  8, 1],
+        [6, 640, 8, 1],
     ]
     return EffNetV2(cfgs, **kwargs)
