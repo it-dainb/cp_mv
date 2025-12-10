@@ -277,6 +277,7 @@ def validate(
     log_wandb=True,
     epoch=0,
     loss_version=1,
+    log_prefix="val",
 ):
     """
     Validate the model with both semantic and instance segmentation metrics.
@@ -290,6 +291,7 @@ def validate(
         log_wandb: Whether to log to wandb
         epoch: Current epoch number for logging
         loss_version: Loss function version (1 for LossV1, 2 for LossV2)
+        log_prefix: Prefix for wandb logging (e.g., "val" or "test")
     """
     model.eval()
 
@@ -308,7 +310,7 @@ def validate(
     # For oF1 computation
     of1_scores = []
 
-    pbar = tqdm(dataloader, desc="Validation")
+    pbar = tqdm(dataloader, desc=f"{log_prefix.capitalize()}")
 
     for batch_idx, (images, masks, case_ids) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
@@ -378,26 +380,26 @@ def validate(
     # Log to wandb
     if log_wandb:
         log_dict = {
-            "val/loss": result["loss"],
-            "val/iou": result["iou"],
-            "val/f1": result["f1"],
-            "val/precision": result["precision"],
-            "val/recall": result["recall"],
-            "val/specificity": result["specificity"],
+            f"{log_prefix}/loss": result["loss"],
+            f"{log_prefix}/iou": result["iou"],
+            f"{log_prefix}/f1": result["f1"],
+            f"{log_prefix}/precision": result["precision"],
+            f"{log_prefix}/recall": result["recall"],
+            f"{log_prefix}/specificity": result["specificity"],
             "epoch": epoch,
         }
 
         # Add loss components with appropriate names
         if loss_version == 1:
-            log_dict["val/dice_loss"] = result["loss_component1"]
-            log_dict["val/bce_loss"] = result["loss_component2"]
+            log_dict[f"{log_prefix}/dice_loss"] = result["loss_component1"]
+            log_dict[f"{log_prefix}/bce_loss"] = result["loss_component2"]
         else:
-            log_dict["val/focal_loss"] = result["loss_component1"]
-            log_dict["val/dice_loss"] = result["loss_component2"]
-            log_dict["val/boundary_loss"] = result["loss_component3"]
+            log_dict[f"{log_prefix}/focal_loss"] = result["loss_component1"]
+            log_dict[f"{log_prefix}/dice_loss"] = result["loss_component2"]
+            log_dict[f"{log_prefix}/boundary_loss"] = result["loss_component3"]
 
         if "oF1" in result:
-            log_dict["val/oF1"] = result["oF1"]
+            log_dict[f"{log_prefix}/oF1"] = result["oF1"]
         wandb.log(log_dict)
 
     return result
@@ -455,6 +457,7 @@ def main(args):
             "loss_version": args.loss_version,
             "dice_weight": args.dice_weight,
             "dataset_path": args.dataset_path,
+            "has_test_split": (dataset_path / "test_samples.json").exists(),
         }
 
         # Add scheduler-specific parameters
@@ -586,6 +589,7 @@ def main(args):
     dataset_path = Path(args.dataset_path)
     train_split_path = dataset_path / "train_samples.json"
     val_split_path = dataset_path / "val_samples.json"
+    test_split_path = dataset_path / "test_samples.json"
 
     if not train_split_path.exists():
         raise FileNotFoundError(f"Train split not found: {train_split_path}")
@@ -593,10 +597,19 @@ def main(args):
         raise FileNotFoundError(f"Val split not found: {val_split_path}")
 
     print(f"  Dataset path: {dataset_path}")
-    print(f"  Loading: {train_split_path.name}, {val_split_path.name}")
+    print(f"  Loading: {train_split_path.name}, {val_split_path.name}", end="")
+
     # Pass dataset_path as base_dir to resolve relative paths
     train_samples = load_samples(train_split_path, base_dir=dataset_path)
     val_samples = load_samples(val_split_path, base_dir=dataset_path)
+
+    # Load test split if exists (optional for backward compatibility)
+    test_samples = None
+    if test_split_path.exists():
+        print(f", {test_split_path.name}")
+        test_samples = load_samples(test_split_path, base_dir=dataset_path)
+    else:
+        print(" (no test split found)")
 
     forged_count_train = sum(1 for s in train_samples if s["is_forged"])
     forged_count_val = sum(1 for s in val_samples if s["is_forged"])
@@ -607,7 +620,25 @@ def main(args):
     print(f"Val: {len(val_samples)} total")
     print(f"  - Forged: {forged_count_val}")
     print(f"  - Authentic: {len(val_samples) - forged_count_val}")
+    if test_samples is not None:
+        forged_count_test = sum(1 for s in test_samples if s["is_forged"])
+        print(f"Test: {len(test_samples)} total")
+        print(f"  - Forged: {forged_count_test}")
+        print(f"  - Authentic: {len(test_samples) - forged_count_test}")
     print("=" * 30)
+
+    # Update wandb config with split sizes
+    if not args.no_wandb:
+        wandb.config.update(
+            {
+                "train_samples": len(train_samples),
+                "train_forged": forged_count_train,
+                "val_samples": len(val_samples),
+                "val_forged": forged_count_val,
+                "test_samples": len(test_samples) if test_samples else 0,
+                "test_forged": forged_count_test if test_samples else 0,
+            }
+        )
 
     # Initialize datasets and dataloaders
     print(f"\nUsing augmentation level: {args.aug_level}")
@@ -658,6 +689,27 @@ def main(args):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
     )
+
+    # Create test dataloader if test split exists
+    test_loader = None
+    if test_samples is not None:
+        test_dataset = ForgeryDetectionDataset(
+            samples=test_samples,
+            imgsz=args.imgsz,
+            split="test",
+            transform=get_val_transforms(args.imgsz, grayscale=args.grayscale),
+            grayscale=args.grayscale,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+        )
+        print(f"Test dataloader: {len(test_loader)} batches")
 
     # Training loop
     best_iou = 0.0
@@ -784,6 +836,71 @@ def main(args):
 
     print("\nTraining completed!")
     print(f"Best validation score: {best_iou:.4f}")
+
+    # Final test evaluation (if test set exists)
+    if test_loader is not None:
+        print("\n" + "=" * 50)
+        print("Running final evaluation on TEST set...")
+        print("=" * 50)
+
+        # Load best model for test evaluation
+        best_model_path = os.path.join(args.output_dir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            print(f"Loading best model from {best_model_path}")
+            checkpoint = torch.load(best_model_path)
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            print("Best model not found, using final model weights")
+
+        test_metrics = validate(
+            model,
+            test_loader,
+            criterion,
+            device,
+            compute_of1=True,  # Always compute oF1 for final test
+            log_wandb=(not args.no_wandb),
+            epoch=args.epochs,  # Use final epoch for logging
+            loss_version=args.loss_version,
+            log_prefix="test",
+        )
+
+        # Print test results
+        print("\n=== FINAL TEST RESULTS ===")
+        if args.loss_version == 1:
+            print(
+                f"Test  - Loss: {test_metrics['loss']:.4f}, "
+                f"Dice: {test_metrics['loss_component1']:.4f}, "
+                f"BCE: {test_metrics['loss_component2']:.4f}"
+            )
+        else:
+            print(
+                f"Test  - Loss: {test_metrics['loss']:.4f}, "
+                f"Focal: {test_metrics['loss_component1']:.4f}, "
+                f"Dice: {test_metrics['loss_component2']:.4f}, "
+                f"Boundary: {test_metrics['loss_component3']:.4f}"
+            )
+
+        print(
+            f"        mIoU: {test_metrics['iou']:.4f}, "
+            f"mF1: {test_metrics['f1']:.4f}, "
+            f"Prec: {test_metrics['precision']:.4f}, "
+            f"Recall: {test_metrics['recall']:.4f}, "
+            f"Spec: {test_metrics['specificity']:.4f}"
+        )
+        if "oF1" in test_metrics:
+            print(f"        oF1 (competition metric): {test_metrics['oF1']:.4f}")
+        print("=" * 30)
+
+        # Store test metrics in wandb summary
+        if not args.no_wandb:
+            wandb.run.summary["test/loss"] = test_metrics["loss"]
+            wandb.run.summary["test/iou"] = test_metrics["iou"]
+            wandb.run.summary["test/f1"] = test_metrics["f1"]
+            wandb.run.summary["test/precision"] = test_metrics["precision"]
+            wandb.run.summary["test/recall"] = test_metrics["recall"]
+            wandb.run.summary["test/specificity"] = test_metrics["specificity"]
+            if "oF1" in test_metrics:
+                wandb.run.summary["test/oF1"] = test_metrics["oF1"]
 
     # Finish wandb run
     if not args.no_wandb:

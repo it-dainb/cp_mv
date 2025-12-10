@@ -13,7 +13,7 @@ Two modes of operation:
    python aug_dataset.py --dataset-dir datasets/processed \
                          --output-dir datasets/augmented \
                          --num-augmentations 2 \
-                         --save-viz
+                         --save-viz --viz-samples 10
 
    Output structure (same as input):
        augmented_dataset/
@@ -665,9 +665,19 @@ def augment_split(
     augmentor: CopyMoveAugmentor,
     num_augmentations: int,
     save_visualizations: bool = False,
+    max_viz_samples: int = 0,
 ) -> list:
     """
     Augment forged samples in a split and save to output directory.
+
+    Args:
+        src_dir: Source dataset directory
+        dst_dir: Destination dataset directory
+        split_name: Name of the split (train, val, test)
+        augmentor: CopyMoveAugmentor instance
+        num_augmentations: Number of augmentations per sample
+        save_visualizations: Whether to save visualizations
+        max_viz_samples: Max samples to save viz for (0 = all)
 
     Returns list of augmented sample dicts.
     """
@@ -720,6 +730,7 @@ def augment_split(
     print(f"  Phase A (with authentic): {phase_a}, Phase B (blind): {phase_b}")
 
     augmented_samples = []
+    viz_count = 0  # Track number of visualizations saved
 
     for sample in tqdm(forged_samples, desc=f"Augmenting {split_name}"):
         case_id = sample["case_id"]
@@ -755,7 +766,13 @@ def augment_split(
                 cv2.imwrite(str(out_img_path), cv2.cvtColor(aug_img, cv2.COLOR_RGB2BGR))
                 np.save(out_mask_path, aug_mask)
 
-                if viz_dir and not viz_info.get("fallback", False):
+                # Save visualization if enabled and within limit
+                should_save_viz = (
+                    viz_dir
+                    and not viz_info.get("fallback", False)
+                    and (max_viz_samples == 0 or viz_count < max_viz_samples)
+                )
+                if should_save_viz:
                     save_train_visualization(
                         viz_dir / f"{aug_case_id}_viz.png",
                         forged_img,
@@ -766,6 +783,7 @@ def augment_split(
                         case_id,
                         aug_idx,
                     )
+                    viz_count += 1
 
                 augmented_samples.append(
                     {
@@ -792,7 +810,11 @@ def augment_split(
                 cv2.imwrite(str(out_img_path), cv2.cvtColor(aug_img, cv2.COLOR_RGB2BGR))
                 np.save(out_mask_path, aug_mask)
 
-                if viz_dir:
+                # Save visualization if enabled and within limit
+                should_save_viz = viz_dir and (
+                    max_viz_samples == 0 or viz_count < max_viz_samples
+                )
+                if should_save_viz:
                     save_supplemental_visualization(
                         viz_dir / f"{aug_case_id}_viz.png",
                         forged_img,
@@ -803,6 +825,7 @@ def augment_split(
                         case_id,
                         aug_idx,
                     )
+                    viz_count += 1
 
                 augmented_samples.append(
                     {
@@ -817,6 +840,8 @@ def augment_split(
                 )
 
     print(f"  Generated {len(augmented_samples)} augmented samples")
+    if save_visualizations:
+        print(f"  Saved {viz_count} visualizations")
     return augmented_samples
 
 
@@ -836,6 +861,9 @@ def process_dataset_mode(args):
     print(f"Output dataset: {output_dir}")
     print(f"Augmentations per sample: {args.num_augmentations}")
     print(f"Save visualizations: {args.save_viz}")
+    if args.save_viz:
+        viz_limit_str = "all" if args.viz_samples == 0 else f"max {args.viz_samples}"
+        print(f"  Visualization samples: {viz_limit_str}")
     print(f"Random seed: {args.seed}")
 
     # Create augmentor
@@ -864,6 +892,7 @@ def process_dataset_mode(args):
         augmentor,
         args.num_augmentations,
         args.save_viz,
+        args.viz_samples,
     )
     all_samples["train"].extend(train_augmented)
     aug_counts["train"] = len(train_augmented)
@@ -875,7 +904,13 @@ def process_dataset_mode(args):
     print(f"Copied {len(val_original)} original val samples")
 
     val_augmented = augment_split(
-        dataset_dir, output_dir, "val", augmentor, args.num_augmentations, args.save_viz
+        dataset_dir,
+        output_dir,
+        "val",
+        augmentor,
+        args.num_augmentations,
+        args.save_viz,
+        args.viz_samples,
     )
     all_samples["val"].extend(val_augmented)
     aug_counts["val"] = len(val_augmented)
@@ -1048,7 +1083,7 @@ Examples:
   python aug_dataset.py --dataset-dir datasets/processed \\
                         --output-dir datasets/augmented \\
                         --num-augmentations 2 \\
-                        --save-viz
+                        --save-viz --viz-samples 10
 
   # Legacy mode - raw directories
   python aug_dataset.py --train-images datasets/train_images \\
@@ -1079,6 +1114,12 @@ Examples:
         help="Output directory (default: datasets/augmented)",
     )
     parser.add_argument("--save-viz", action="store_true", help="Save visualizations")
+    parser.add_argument(
+        "--viz-samples",
+        type=int,
+        default=0,
+        help="Max number of samples to save visualizations for (0 = all, default: 0)",
+    )
 
     # Augmentation settings
     parser.add_argument("--num-augmentations", type=int, default=1)
