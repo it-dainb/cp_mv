@@ -713,6 +713,15 @@ def main(args):
 
     # Learning rate scheduler (use scaled values)
     if args.scheduler == "warmup_cosine":
+        # Warn if using warmup_cosine with progressive augmentation
+        if args.progressive_aug:
+            print_rank0("\n" + "=" * 60)
+            print_rank0("WARNING: Using warmup_cosine with progressive augmentation")
+            print_rank0("  Late epochs have hard augmentations but low learning rate.")
+            print_rank0(
+                "  Consider using --scheduler cosine_restarts for better results."
+            )
+            print_rank0("=" * 60 + "\n")
         print_rank0(
             f"Using WarmupCosineScheduler (warmup: {args.warmup_epochs} epochs)"
         )
@@ -724,13 +733,20 @@ def main(args):
             eta_min=scaled_min_lr,
         )
     elif args.scheduler == "cosine_restarts":
-        print_rank0(
-            f"Using CosineAnnealingWarmRestarts (T_0: {args.t0}, T_mult: {args.t_mult})"
-        )
+        # Auto-set t0 to align with progressive augmentation phases
+        t0 = args.t0
+        if args.progressive_aug and args.t0 == 10:  # 10 is the default value
+            t0 = args.epochs // 4
+            print_rank0(
+                f"\nProgressive aug detected: auto-setting T_0 = epochs/4 = {t0}"
+            )
         from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
+        print_rank0(
+            f"Using CosineAnnealingWarmRestarts (T_0: {t0}, T_mult: {args.t_mult})"
+        )
         scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=scaled_min_lr
+            optimizer, T_0=t0, T_mult=args.t_mult, eta_min=scaled_min_lr
         )
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
