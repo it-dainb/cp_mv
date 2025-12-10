@@ -173,6 +173,34 @@ class WarmupCosineScheduler:
         pass
 
 
+def get_progressive_aug_level(epoch: int, total_epochs: int, max_level: int = 3) -> int:
+    """
+    Calculate augmentation level for progressive/curriculum learning.
+
+    Divides training into (max_level + 1) phases, each using a different aug level.
+    This helps the model learn basic features first, then gradually adapt to
+    harder augmentations.
+
+    Args:
+        epoch: Current epoch (0-indexed)
+        total_epochs: Total number of training epochs
+        max_level: Maximum augmentation level (default: 3)
+
+    Returns:
+        Augmentation level for the current epoch (0 to max_level)
+
+    Example with 100 epochs and max_level=3:
+        Epochs 0-24:   level 0 (no augmentation)
+        Epochs 25-49:  level 1 (light augmentation)
+        Epochs 50-74:  level 2 (medium augmentation)
+        Epochs 75-99:  level 3 (strong augmentation)
+    """
+    num_phases = max_level + 1
+    epochs_per_phase = total_epochs / num_phases
+    current_level = int(epoch / epochs_per_phase)
+    return min(current_level, max_level)
+
+
 # Dataset is now imported from dataset.py
 # See dataset.py for ForgeryDetectionDataset implementation
 
@@ -546,6 +574,7 @@ def main(args):
             "weight_decay": args.weight_decay,
             "imgsz": args.imgsz,
             "aug_level": args.aug_level,
+            "progressive_aug": args.progressive_aug,
             "grayscale": args.grayscale,
             "scheduler": args.scheduler,
             "min_lr": args.min_lr,
@@ -776,29 +805,65 @@ def main(args):
         )
 
     # Initialize datasets and dataloaders
-    print_rank0(f"\nUsing augmentation level: {args.aug_level}")
-    if args.aug_level == 0:
-        print_rank0("  → No augmentation (normalize only)")
-    elif args.aug_level == 1:
-        print_rank0("  → Light: flips + small brightness/contrast")
-    elif args.aug_level == 2:
-        print_rank0("  → Medium: + shift/scale/rotate + noise + CLAHE")
-    elif args.aug_level == 3:
-        print_rank0("  → Strong: + blur + elastic + coarse dropout")
+    # Determine initial augmentation level
+    if args.progressive_aug:
+        current_aug_level = get_progressive_aug_level(start_epoch, args.epochs)
+        print_rank0(f"\nProgressive augmentation enabled!")
+        print_rank0(f"  Training will progress through aug levels 0 → 3")
+        print_rank0(f"  Starting at level {current_aug_level} (epoch {start_epoch})")
+    else:
+        current_aug_level = args.aug_level
+        print_rank0(f"\nUsing fixed augmentation level: {current_aug_level}")
+
+    # Print aug level description
+    aug_descriptions = {
+        0: "No augmentation (normalize only)",
+        1: "Light: flips + small brightness/contrast",
+        2: "Medium: + shift/scale/rotate + noise + CLAHE",
+        3: "Strong: + blur + elastic + coarse dropout",
+    }
+    print_rank0(f"  → {aug_descriptions.get(current_aug_level, 'Unknown')}")
 
     if args.grayscale:
         print_rank0("  → Grayscale mode: ON (1 channel input)")
 
-    train_dataset = ForgeryDetectionDataset(
-        samples=train_samples,
-        imgsz=args.imgsz,
-        split="train",
-        transform=get_train_transforms(
-            args.imgsz, aug_level=args.aug_level, grayscale=args.grayscale
-        ),
-        grayscale=args.grayscale,
-    )
+    # Helper function to create train dataloader with specific aug level
+    def create_train_dataloader(aug_level):
+        train_dataset = ForgeryDetectionDataset(
+            samples=train_samples,
+            imgsz=args.imgsz,
+            split="train",
+            transform=get_train_transforms(
+                args.imgsz, aug_level=aug_level, grayscale=args.grayscale
+            ),
+            grayscale=args.grayscale,
+        )
 
+        train_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=get_world_size(),
+                rank=get_rank(),
+                shuffle=True,
+            )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            drop_last=True if distributed else False,
+        )
+        return train_loader, train_sampler
+
+    # Create initial train dataloader
+    train_loader, train_sampler = create_train_dataloader(current_aug_level)
+
+    # Create validation dataset and dataloader
     val_dataset = ForgeryDetectionDataset(
         samples=val_samples,
         imgsz=args.imgsz,
@@ -807,30 +872,11 @@ def main(args):
         grayscale=args.grayscale,
     )
 
-    # Create distributed samplers if using DDP
-    train_sampler = None
     val_sampler = None
     if distributed:
-        train_sampler = DistributedSampler(
-            train_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=True
-        )
         val_sampler = DistributedSampler(
             val_dataset, num_replicas=get_world_size(), rank=get_rank(), shuffle=False
         )
-        print_rank0(
-            f"Using DistributedSampler for data sharding across {get_world_size()} GPUs"
-        )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),  # Only shuffle if not using sampler
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
-        drop_last=True if distributed else False,  # Drop last incomplete batch for DDP
-    )
 
     val_loader = DataLoader(
         val_dataset,
@@ -883,12 +929,31 @@ def main(args):
         )
 
     for epoch in range(start_epoch, args.epochs):
+        # Progressive augmentation: check if we need to update aug level
+        if args.progressive_aug:
+            new_aug_level = get_progressive_aug_level(epoch, args.epochs)
+            if new_aug_level != current_aug_level:
+                current_aug_level = new_aug_level
+                print_rank0(f"\n{'=' * 50}")
+                print_rank0(f"Progressive Aug: Switching to level {current_aug_level}")
+                print_rank0(f"  → {aug_descriptions.get(current_aug_level, 'Unknown')}")
+                print_rank0(f"{'=' * 50}")
+
+                # Recreate train dataloader with new augmentation level
+                train_loader, train_sampler = create_train_dataloader(current_aug_level)
+
         # Set epoch for distributed sampler (ensures different shuffling each epoch)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         print_rank0(f"\nEpoch {epoch}/{args.epochs - 1}")
         print_rank0(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
+        if args.progressive_aug:
+            print_rank0(f"Aug level: {current_aug_level}")
+
+        # Log aug level to wandb
+        if not args.no_wandb and is_main_process():
+            wandb.log({"aug_level": current_aug_level, "epoch": epoch})
 
         # Train
         train_metrics = train_one_epoch(
@@ -1169,6 +1234,11 @@ if __name__ == "__main__":
         default=0,
         choices=[0, 1, 2, 3],
         help="Online augmentation level: 0=none, 1=light (flips), 2=medium (+noise/rotate), 3=strong (+elastic/dropout)",
+    )
+    parser.add_argument(
+        "--progressive-aug",
+        action="store_true",
+        help="Enable progressive augmentation: start with level 0 and gradually increase to level 3 during training (curriculum learning)",
     )
     parser.add_argument(
         "--grayscale",
