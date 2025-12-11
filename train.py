@@ -335,11 +335,15 @@ class CosineAnnealingWarmRestartsDecay:
         decay_factor = self.decay**self.cycle
 
         # Cosine annealing within current cycle
+        # Use (T_i - 1) as denominator so that the last epoch (T_cur = T_i - 1)
+        # reaches exactly eta_min (cos(π) = -1)
+        # This ensures smooth ending at minimum LR
+        T_denom = max(self.T_i - 1, 1)  # Avoid division by zero for single-epoch cycles
         lrs = [
             self.eta_min
             + (base_lr * decay_factor - self.eta_min)
             * 0.5
-            * (1 + np.cos(np.pi * self.T_cur / self.T_i))
+            * (1 + np.cos(np.pi * self.T_cur / T_denom))
             for base_lr in self.base_lrs
         ]
         return lrs
@@ -1186,6 +1190,13 @@ def main(args):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
+        # Update learning rate at START of epoch (before training)
+        # This ensures the scheduler computes LR for the current epoch
+        if args.scheduler == "warmup_cosine":
+            scheduler.step(epoch)
+        elif args.scheduler == "cosine_restarts":
+            scheduler.step(epoch)
+
         print_rank0(f"\nEpoch {epoch}/{args.epochs - 1}")
         print_rank0(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
         if args.progressive_aug:
@@ -1271,19 +1282,11 @@ def main(args):
             print_str += f", oF1: {val_metrics['oF1']:.4f}"
         print_rank0(print_str)
 
-        # Log learning rate to wandb BEFORE scheduler.step()
-        # This logs the LR that was actually used for training this epoch
+        # Log learning rate to wandb (the LR used for training this epoch)
         if not args.no_wandb and is_main_process():
             wandb.log(
                 {"learning_rate": optimizer.param_groups[0]["lr"], "epoch": epoch}
             )
-
-        # Update learning rate for next epoch
-        if args.scheduler == "warmup_cosine":
-            scheduler.step(epoch)
-        elif args.scheduler == "cosine_restarts":
-            # CosineAnnealingWarmRestarts steps after each epoch
-            scheduler.step()
 
         # Save checkpoint (only on main process)
         if is_main_process() and (epoch + 1) % args.save_freq == 0:
