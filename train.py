@@ -220,6 +220,10 @@ class CosineAnnealingWarmRestartsDecay:
     augmentation where early phases need high LR and later phases benefit from
     more stable, lower LR.
 
+    When total_epochs is provided, the scheduler uses fractional cycle positions
+    to ensure smooth cosine curves that end exactly at eta_min on the final epoch,
+    regardless of whether epochs divides evenly by T_0.
+
     Args:
         optimizer: Wrapped optimizer
         T_0: Number of epochs for the first restart cycle
@@ -227,12 +231,12 @@ class CosineAnnealingWarmRestartsDecay:
         eta_min: Minimum learning rate (default: 1e-6)
         decay: Factor to multiply max LR after each restart (default: 1.0, no decay)
                e.g., decay=0.8 means max LR becomes 80% after each restart
+        total_epochs: Total number of training epochs (required for smooth ending)
 
-    Example with T_0=25, decay=0.8, base_lr=1e-4:
-        Epochs 0-24:   LR: 1e-4 → 1e-6
-        Epochs 25-49:  LR: 8e-5 → 1e-6  (decayed by 0.8)
-        Epochs 50-74:  LR: 6.4e-5 → 1e-6  (decayed by 0.8^2)
-        Epochs 75-99:  LR: 5.1e-5 → 1e-6  (decayed by 0.8^3)
+    Example with T_0=12, decay=0.8, base_lr=1e-4, total_epochs=50:
+        The scheduler computes num_cycles = ceil(50/12) = 5
+        Effective cycle length = 50/5 = 10.0 epochs per cycle
+        Each cycle smoothly goes from max_lr to eta_min over 10 epochs
     """
 
     def __init__(
@@ -243,6 +247,7 @@ class CosineAnnealingWarmRestartsDecay:
         eta_min=1e-6,
         decay=1.0,
         last_epoch=-1,
+        total_epochs=None,
     ):
         self.optimizer = optimizer
         self.T_0 = T_0
@@ -250,6 +255,7 @@ class CosineAnnealingWarmRestartsDecay:
         self.eta_min = eta_min
         self.decay = decay
         self.last_epoch = last_epoch
+        self.total_epochs = total_epochs
 
         # Store base learning rates
         self.base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -258,6 +264,15 @@ class CosineAnnealingWarmRestartsDecay:
         self.T_cur = 0  # Current position in cycle
         self.T_i = T_0  # Current cycle length
         self.cycle = 0  # Current cycle number
+
+        # Compute effective cycle length for smooth ending
+        self._effective_T = None
+        self._num_cycles = None
+        if total_epochs is not None and T_mult == 1:
+            # Calculate number of cycles needed (round up to ensure coverage)
+            self._num_cycles = int(np.ceil(total_epochs / T_0))
+            # Effective cycle length to exactly fit total_epochs
+            self._effective_T = total_epochs / self._num_cycles
 
     def get_lr(self):
         """Calculate learning rate for current epoch"""
@@ -280,8 +295,14 @@ class CosineAnnealingWarmRestartsDecay:
             epoch = self.last_epoch + 1
         self.last_epoch = epoch
 
-        # Determine which cycle we're in and position within cycle
-        if epoch >= self.T_0:
+        # Use effective cycle length for smooth ending
+        if self._effective_T is not None:
+            # Fractional cycle calculation for smooth curves
+            self.cycle = int(epoch / self._effective_T)
+            self.T_cur = epoch - self.cycle * self._effective_T
+            self.T_i = self._effective_T
+        # Fallback to original behavior if total_epochs not provided
+        elif epoch >= self.T_0:
             if self.T_mult == 1:
                 self.cycle = epoch // self.T_0
                 self.T_cur = epoch % self.T_0
@@ -300,6 +321,7 @@ class CosineAnnealingWarmRestartsDecay:
         else:
             self.T_cur = epoch
             self.cycle = 0
+            self.T_i = self.T_0
 
         lrs = self.get_lr()
         for param_group, lr in zip(self.optimizer.param_groups, lrs):
@@ -887,7 +909,7 @@ def main(args):
         # Auto-set decay for progressive augmentation if not specified
         lr_decay = args.lr_decay
         print_rank0(
-            f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {args.t_mult}, decay: {lr_decay})"
+            f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {args.t_mult}, decay: {lr_decay}, total_epochs: {args.epochs})"
         )
         scheduler = CosineAnnealingWarmRestartsDecay(
             optimizer,
@@ -895,6 +917,7 @@ def main(args):
             T_mult=args.t_mult,
             eta_min=scaled_min_lr,
             decay=lr_decay,
+            total_epochs=args.epochs,
         )
     else:
         raise ValueError(f"Unknown scheduler type: {args.scheduler}")
