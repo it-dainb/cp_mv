@@ -878,7 +878,7 @@ def main(args):
     elif args.scheduler == "cosine_restarts":
         # Auto-set t0 to align with progressive augmentation phases
         t0 = args.t0
-        if args.progressive_aug and args.t0 == 10:  # 10 is the default value
+        if args.progressive_aug:
             t0 = args.epochs // 4
             print_rank0(
                 f"\nProgressive aug detected: auto-setting T_0 = epochs/4 = {t0}"
