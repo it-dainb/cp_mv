@@ -220,9 +220,10 @@ class CosineAnnealingWarmRestartsDecay:
     augmentation where early phases need high LR and later phases benefit from
     more stable, lower LR.
 
-    When total_epochs is provided, the scheduler uses fractional cycle positions
-    to ensure smooth cosine curves that end exactly at eta_min on the final epoch,
-    regardless of whether epochs divides evenly by T_0.
+    When total_epochs is provided, the scheduler keeps the same number of cycles
+    (total_epochs // T_0) but distributes any remainder epochs across the later
+    cycles. This ensures each cycle completes a full smooth cosine curve and
+    training ends exactly at eta_min.
 
     Args:
         optimizer: Wrapped optimizer
@@ -234,9 +235,9 @@ class CosineAnnealingWarmRestartsDecay:
         total_epochs: Total number of training epochs (required for smooth ending)
 
     Example with T_0=12, decay=0.8, base_lr=1e-4, total_epochs=50:
-        The scheduler computes num_cycles = ceil(50/12) = 5
-        Effective cycle length = 50/5 = 10.0 epochs per cycle
-        Each cycle smoothly goes from max_lr to eta_min over 10 epochs
+        num_cycles = 50 // 12 = 4, remainder = 50 % 12 = 2
+        Cycle lengths: [12, 12, 13, 13] (remainder distributed to later cycles)
+        Each cycle completes a full smooth cosine from max_lr to eta_min
     """
 
     def __init__(
@@ -265,14 +266,68 @@ class CosineAnnealingWarmRestartsDecay:
         self.T_i = T_0  # Current cycle length
         self.cycle = 0  # Current cycle number
 
-        # Compute effective cycle length for smooth ending
-        self._effective_T = None
+        # Pre-compute cycle boundaries for smooth ending
+        self._cycle_starts = None  # Start epoch for each cycle
+        self._cycle_lengths = None  # Length of each cycle
         self._num_cycles = None
         if total_epochs is not None and T_mult == 1:
-            # Calculate number of cycles needed (round up to ensure coverage)
-            self._num_cycles = int(np.ceil(total_epochs / T_0))
-            # Effective cycle length to exactly fit total_epochs
-            self._effective_T = total_epochs / self._num_cycles
+            self._compute_cycle_boundaries()
+
+    def _compute_cycle_boundaries(self):
+        """
+        Compute cycle start epochs and lengths to fit total_epochs exactly.
+        Distributes remainder epochs to the later cycles.
+        """
+        num_cycles = self.total_epochs // self.T_0
+        if num_cycles == 0:
+            num_cycles = 1  # At least one cycle
+
+        remainder = self.total_epochs - (num_cycles * self.T_0)
+
+        # Distribute remainder to later cycles
+        # e.g., 50 epochs, T_0=12, num_cycles=4, remainder=2
+        # lengths = [12, 12, 13, 13]
+        self._cycle_lengths = []
+        for i in range(num_cycles):
+            length = self.T_0
+            # Add 1 to later cycles to distribute remainder
+            if i >= num_cycles - remainder:
+                length += 1
+            self._cycle_lengths.append(length)
+
+        # Compute start epochs for each cycle
+        self._cycle_starts = [0]
+        for i in range(num_cycles - 1):
+            self._cycle_starts.append(self._cycle_starts[-1] + self._cycle_lengths[i])
+
+        self._num_cycles = num_cycles
+
+    def _get_cycle_info(self, epoch):
+        """Get cycle number, position within cycle, and cycle length for given epoch."""
+        if self._cycle_starts is None:
+            # Fallback to original behavior
+            if epoch >= self.T_0:
+                if self.T_mult == 1:
+                    return epoch // self.T_0, epoch % self.T_0, self.T_0
+                else:
+                    n = int(
+                        np.log((epoch / self.T_0 * (self.T_mult - 1) + 1))
+                        / np.log(self.T_mult)
+                    )
+                    T_cur = epoch - self.T_0 * (self.T_mult**n - 1) // (self.T_mult - 1)
+                    T_i = self.T_0 * self.T_mult**n
+                    return n, T_cur, T_i
+            else:
+                return 0, epoch, self.T_0
+
+        # Find which cycle this epoch belongs to
+        for i in range(self._num_cycles - 1, -1, -1):
+            if epoch >= self._cycle_starts[i]:
+                T_cur = epoch - self._cycle_starts[i]
+                T_i = self._cycle_lengths[i]
+                return i, T_cur, T_i
+
+        return 0, epoch, self._cycle_lengths[0]
 
     def get_lr(self):
         """Calculate learning rate for current epoch"""
@@ -295,33 +350,8 @@ class CosineAnnealingWarmRestartsDecay:
             epoch = self.last_epoch + 1
         self.last_epoch = epoch
 
-        # Use effective cycle length for smooth ending
-        if self._effective_T is not None:
-            # Fractional cycle calculation for smooth curves
-            self.cycle = int(epoch / self._effective_T)
-            self.T_cur = epoch - self.cycle * self._effective_T
-            self.T_i = self._effective_T
-        # Fallback to original behavior if total_epochs not provided
-        elif epoch >= self.T_0:
-            if self.T_mult == 1:
-                self.cycle = epoch // self.T_0
-                self.T_cur = epoch % self.T_0
-                self.T_i = self.T_0
-            else:
-                # Handle T_mult > 1 (increasing cycle lengths)
-                n = int(
-                    np.log((epoch / self.T_0 * (self.T_mult - 1) + 1))
-                    / np.log(self.T_mult)
-                )
-                self.cycle = n
-                self.T_cur = epoch - self.T_0 * (self.T_mult**n - 1) // (
-                    self.T_mult - 1
-                )
-                self.T_i = self.T_0 * self.T_mult**n
-        else:
-            self.T_cur = epoch
-            self.cycle = 0
-            self.T_i = self.T_0
+        # Get cycle info (handles both old and new behavior)
+        self.cycle, self.T_cur, self.T_i = self._get_cycle_info(epoch)
 
         lrs = self.get_lr()
         for param_group, lr in zip(self.optimizer.param_groups, lrs):
