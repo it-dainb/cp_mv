@@ -1271,18 +1271,19 @@ def main(args):
             print_str += f", oF1: {val_metrics['oF1']:.4f}"
         print_rank0(print_str)
 
-        # Update learning rate
+        # Log learning rate to wandb BEFORE scheduler.step()
+        # This logs the LR that was actually used for training this epoch
+        if not args.no_wandb and is_main_process():
+            wandb.log(
+                {"learning_rate": optimizer.param_groups[0]["lr"], "epoch": epoch}
+            )
+
+        # Update learning rate for next epoch
         if args.scheduler == "warmup_cosine":
             scheduler.step(epoch)
         elif args.scheduler == "cosine_restarts":
             # CosineAnnealingWarmRestarts steps after each epoch
             scheduler.step()
-
-        # Log learning rate to wandb (only on main process)
-        if not args.no_wandb and is_main_process():
-            wandb.log(
-                {"learning_rate": optimizer.param_groups[0]["lr"], "epoch": epoch}
-            )
 
         # Save checkpoint (only on main process)
         if is_main_process() and (epoch + 1) % args.save_freq == 0:
