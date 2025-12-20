@@ -366,33 +366,37 @@ def get_progressive_aug_level(epoch: int, total_epochs: int, max_level: int = 3)
     """
     Calculate augmentation level for progressive/curriculum learning.
 
-    Divides training into (max_level + 1) phases, each using a different aug level.
-    This helps the model learn basic features first, then gradually adapt to
-    harder augmentations.
+    Divides training into 2 phases:
+    - First half: light augmentation (level 1)
+    - Second half: strong augmentation (level 3)
 
-    Uses integer division (total_epochs // num_phases) to align with LR scheduler
-    cycle boundaries when using cosine_restarts with T_0 = total_epochs // 4.
+    This simplified approach helps the model learn basic features first with
+    light augmentation, then adapt to harder augmentations in the second half.
+
+    Uses integer division (total_epochs // 2) to align with LR scheduler
+    cycle boundaries when using cosine_restarts with T_0 = total_epochs // 2.
 
     Args:
         epoch: Current epoch (0-indexed)
         total_epochs: Total number of training epochs
-        max_level: Maximum augmentation level (default: 3)
+        max_level: Maximum augmentation level (default: 3, used for strong phase)
 
     Returns:
-        Augmentation level for the current epoch (0 to max_level)
+        Augmentation level: 1 (light) for first half, 3 (strong) for second half
 
-    Example with 100 epochs and max_level=3:
-        Epochs 0-24:   level 0 (no augmentation)
-        Epochs 25-49:  level 1 (light augmentation)
-        Epochs 50-74:  level 2 (medium augmentation)
-        Epochs 75-99:  level 3 (strong augmentation)
+    Example with 100 epochs:
+        Epochs 0-49:   level 1 (light augmentation)
+        Epochs 50-99:  level 3 (strong augmentation)
     """
-    num_phases = max_level + 1
-    epochs_per_phase = total_epochs // num_phases  # Integer division to align with T_0
-    if epochs_per_phase == 0:
-        epochs_per_phase = 1  # Safety for very short training
-    current_level = epoch // epochs_per_phase
-    return min(current_level, max_level)
+    # 2 phases: light (level 1) -> strong (level 3)
+    half_epochs = total_epochs // 2
+    if half_epochs == 0:
+        half_epochs = 1  # Safety for very short training
+
+    if epoch < half_epochs:
+        return 1  # Light augmentation
+    else:
+        return max_level  # Strong augmentation (default: 3)
 
 
 # Dataset is now imported from dataset.py
@@ -934,21 +938,23 @@ def main(args):
     elif args.scheduler == "cosine_restarts":
         # Auto-set t0 to align with progressive augmentation phases
         t0 = args.t0
+        t_mult = args.t_mult
         if args.progressive_aug:
-            t0 = args.epochs // 4
+            t0 = args.epochs // 2
+            t_mult = 1  # Force t_mult=1 for equal cycle lengths with progressive aug
             print_rank0(
-                f"\nProgressive aug detected: auto-setting T_0 = epochs/4 = {t0}"
+                f"\nProgressive aug detected: auto-setting T_0 = epochs/2 = {t0}, T_mult = 1"
             )
 
         # Auto-set decay for progressive augmentation if not specified
         lr_decay = args.lr_decay
         print_rank0(
-            f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {args.t_mult}, decay: {lr_decay}, total_epochs: {args.epochs})"
+            f"Using CosineAnnealingWarmRestartsDecay (T_0: {t0}, T_mult: {t_mult}, decay: {lr_decay}, total_epochs: {args.epochs})"
         )
         scheduler = CosineAnnealingWarmRestartsDecay(
             optimizer,
             T_0=t0,
-            T_mult=args.t_mult,
+            T_mult=t_mult,
             eta_min=scaled_min_lr,
             decay=lr_decay,
             total_epochs=args.epochs,
@@ -1029,7 +1035,7 @@ def main(args):
     if args.progressive_aug:
         current_aug_level = get_progressive_aug_level(start_epoch, args.epochs)
         print_rank0(f"\nProgressive augmentation enabled!")
-        print_rank0(f"  Training will progress through aug levels 0 → 3")
+        print_rank0(f"  Training will progress through 2 phases: light (1) → strong (3)")
         print_rank0(f"  Starting at level {current_aug_level} (epoch {start_epoch})")
     else:
         current_aug_level = 0
