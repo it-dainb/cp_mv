@@ -21,10 +21,11 @@ from competition_metrics import rle_encode
 class TestDataset(Dataset):
     """Dataset for test images"""
 
-    def __init__(self, image_dir, imgsz=512, transform=None):
+    def __init__(self, image_dir, imgsz=512, transform=None, grayscale=False):
         self.image_dir = Path(image_dir)
         self.imgsz = imgsz if isinstance(imgsz, tuple) else (imgsz, imgsz)
         self.transform = transform
+        self.grayscale = grayscale
 
         # Collect all test images
         self.image_files = sorted(
@@ -44,6 +45,11 @@ class TestDataset(Dataset):
         image = cv2.imread(str(img_path))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         original_size = image.shape[:2]  # (H, W)
+
+        # Convert to grayscale if requested
+        if self.grayscale:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            image = gray[:, :, np.newaxis]  # Shape: [H, W, 1]
 
         # Resize if needed
         if image.shape[:2] != self.imgsz:
@@ -160,7 +166,8 @@ def main(args):
 
     # Load model
     print("Loading model...")
-    model = CMSegNet()
+    in_channels = 1 if args.grayscale else 3
+    model = CMSegNet(in_channels=in_channels)
 
     # Load checkpoint
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -181,7 +188,8 @@ def main(args):
     test_dataset = TestDataset(
         image_dir=args.test_images,
         imgsz=args.imgsz,
-        transform=get_val_transforms(args.imgsz),
+        transform=get_val_transforms(args.imgsz, grayscale=args.grayscale),
+        grayscale=args.grayscale,
     )
 
     test_loader = DataLoader(
@@ -266,6 +274,11 @@ if __name__ == "__main__":
         "--compile",
         action="store_true",
         help="Use torch.compile() for faster inference",
+    )
+    parser.add_argument(
+        "--grayscale",
+        action="store_true",
+        help="Use grayscale input (must match training config)",
     )
 
     # Output options

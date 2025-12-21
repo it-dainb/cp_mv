@@ -1393,7 +1393,18 @@ def main(args):
         test_model.eval()
 
         # Re-create test criterion
-        test_criterion = CombinedLoss(version=args.loss_version)
+        if args.loss_version == 1:
+            test_criterion = LossV1(dice_weight=args.dice_weight, eps=1.0)
+        else:
+            test_criterion = LossV2(
+                focal_weight=args.focal_weight,
+                dice_weight=args.dice_weight,
+                boundary_weight=args.boundary_weight,
+                focal_alpha=args.focal_alpha,
+                focal_gamma=args.focal_gamma,
+                boundary_theta=args.boundary_theta,
+                dice_eps=1.0,
+            )
 
         test_metrics = validate(
             test_model,
